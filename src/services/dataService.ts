@@ -48,7 +48,9 @@ import type {
   ResourceAssignmentAudit,
   EmergencyLifecycleEvent,
   EmergencyLifecycleStatus,
-  ProviderUpdateRequest
+  ProviderUpdateRequest,
+  CaseFeedback,
+  CaseFeedbackProviderRef
 } from '../types';
 
 export interface ResourceRequestDraft {
@@ -320,6 +322,7 @@ export const INITIAL_HOSPITAL: HospitalProfile = {
   city: 'Hubballi',
   state: 'Karnataka',
   address: 'Vidyanagar, PB Road, Hubballi',
+  coordinates: { lat: 15.3524, lng: 75.1328 },
   isVerified: true,
   lastUpdated: new Date().toISOString()
 };
@@ -342,6 +345,7 @@ export const INITIAL_BLOOD_BANK: BloodBankProfile = {
   city: 'Hubballi',
   state: 'Karnataka',
   address: 'Club Road, Deshpande Nagar, Hubballi',
+  coordinates: { lat: 15.3548, lng: 75.1392 },
   isVerified: true,
   lastUpdated: new Date().toISOString()
 };
@@ -357,6 +361,7 @@ export const INITIAL_OXYGEN: OxygenProfile = {
   city: 'Hubballi',
   state: 'Karnataka',
   address: 'Gokul Road Industrial Area, Hubballi',
+  coordinates: { lat: 15.3612, lng: 75.1095 },
   isVerified: true,
   lastUpdated: new Date().toISOString()
 };
@@ -369,6 +374,7 @@ export const INITIAL_AMBULANCE: AmbulanceProfile = {
   city: 'Hubballi',
   state: 'Karnataka',
   address: 'Station Road, Hubballi',
+  coordinates: { lat: 15.3580, lng: 75.1420 },
   isVerified: true,
   vehicles: [
     {
@@ -579,6 +585,7 @@ interface StoreState {
   clinicalNotes: ClinicalNote[];
   patientLinks: PatientLink[];
   providerUpdateRequests: ProviderUpdateRequest[];
+  feedback: CaseFeedback[];
 }
 
 type Listener = () => void;
@@ -628,7 +635,8 @@ class DataStore {
               : { [INITIAL_AMBULANCE.uid]: INITIAL_AMBULANCE },
             clinicalNotes: Array.isArray(parsed.clinicalNotes) ? parsed.clinicalNotes : [],
             patientLinks: Array.isArray(parsed.patientLinks) ? parsed.patientLinks : [],
-            providerUpdateRequests: Array.isArray(parsed.providerUpdateRequests) ? parsed.providerUpdateRequests : []
+            providerUpdateRequests: Array.isArray(parsed.providerUpdateRequests) ? parsed.providerUpdateRequests : [],
+            feedback: Array.isArray(parsed.feedback) ? parsed.feedback : []
           };
         }
       }
@@ -648,7 +656,8 @@ class DataStore {
       ambulanceProfiles: { [INITIAL_AMBULANCE.uid]: INITIAL_AMBULANCE },
       clinicalNotes: [],
       patientLinks: [],
-      providerUpdateRequests: []
+      providerUpdateRequests: [],
+      feedback: []
     };
   }
 
@@ -2430,14 +2439,21 @@ class DataStore {
 
     // Notify patient & attendant
     const recipientUids = Array.from(new Set([existingCase?.patientUid, existingCase?.attendantUid, existingCase?.requesterUid].filter(Boolean))) as string[];
+    const isCompletedTransition = nextStatus === 'COMPLETED';
     for (const rUid of recipientUids) {
       this.addNotification({
         id: `notif-${Date.now()}-${rUid.slice(-4)}`,
         recipientUid: rUid,
-        type: 'case_updated',
-        title: `Emergency Case ${caseId}: ${nextStatus.replace('_', ' ')}`,
-        message: `Your emergency status was updated to "${nextStatus.replace('_', ' ')}"${normalizedReason ? ` - Note: ${normalizedReason}` : ''}.`,
+        type: isCompletedTransition ? 'feedback_available' : 'case_updated',
+        title: isCompletedTransition
+          ? `Case ${caseId} Completed — Share Feedback`
+          : `Emergency Case ${caseId}: ${nextStatus.replace('_', ' ')}`,
+        message: isCompletedTransition
+          ? `Emergency case ${caseId} is marked completed. An optional feedback form is now available on your dashboard.`
+          : `Your emergency status was updated to "${nextStatus.replace('_', ' ')}"${normalizedReason ? ` - Note: ${normalizedReason}` : ''}.`,
         relatedCaseId: caseId,
+        emergencyId: caseId,
+        newStatus: nextStatus,
         isRead: false,
         createdAt: nowIso
       });
@@ -2448,8 +2464,12 @@ class DataStore {
             id: notifRef.id,
             recipientUid: rUid,
             type: 'case_updated',
-            title: `Emergency Case ${caseId} Status Updated`,
-            message: `Emergency status updated to ${nextStatus.replace('_', ' ')}${normalizedReason ? ` (${normalizedReason})` : ''}`,
+            title: isCompletedTransition
+              ? `Emergency Case ${caseId} Completed — Feedback Available`
+              : `Emergency Case ${caseId} Status Updated`,
+            message: isCompletedTransition
+              ? `Emergency case ${caseId} is marked completed. You may optionally submit feedback on your dashboard.`
+              : `Emergency status updated to ${nextStatus.replace('_', ' ')}${normalizedReason ? ` (${normalizedReason})` : ''}`,
             emergencyId: caseId,
             relatedCaseId: caseId,
             isRead: false,
@@ -3082,14 +3102,21 @@ class DataStore {
 
       // Notify patient and attendant of emergency status progress
       const recipients = Array.from(new Set([item.patientUid, item.attendantUid, item.attendant?.uid].filter(Boolean))) as string[];
+      const isCompletedUpdate = isCaseCompletedStatus(String(status));
       recipients.forEach((recipUid) => {
         this.addNotification({
           id: 'notif-' + Date.now() + '-' + recipUid.slice(-4),
           recipientUid: recipUid,
-          type: 'system_alert',
-          title: `Emergency ${item.caseId} Status: ${String(status).replace('_', ' ')}`,
-          message: `Case condition status updated to "${String(status).replace('_', ' ')}"${updater?.note ? ` - ${updater.note}` : ''}.`,
+          type: isCompletedUpdate ? 'feedback_available' : 'system_alert',
+          title: isCompletedUpdate
+            ? `Case ${item.caseId} Completed — Feedback Available`
+            : `Emergency ${item.caseId} Status: ${String(status).replace('_', ' ')}`,
+          message: isCompletedUpdate
+            ? `Emergency case ${item.caseId} is marked completed. You can now optionally share feedback on your experience from your dashboard.`
+            : `Case condition status updated to "${String(status).replace('_', ' ')}"${updater?.note ? ` - ${updater.note}` : ''}.`,
           relatedCaseId: item.caseId,
+          emergencyId: item.caseId,
+          newStatus: String(status),
           isRead: false,
           createdAt: new Date().toISOString()
         });
@@ -3529,10 +3556,16 @@ class DataStore {
       this.addNotification({
         id: 'notif-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
         recipientUid: rUid,
-        type: 'ambulance_updated',
-        title: `Ambulance: ${status.toUpperCase().replace('_', ' ')}`,
-        message: `Ambulance (${trip.vehicleId}) status updated: ${note || status.replace('_', ' ')}.`,
+        type: status === 'completed' ? 'feedback_available' : 'ambulance_updated',
+        title: status === 'completed'
+          ? `Case ${trip.caseId} Completed — Share Feedback`
+          : `Ambulance: ${status.toUpperCase().replace('_', ' ')}`,
+        message: status === 'completed'
+          ? `Ambulance (${trip.vehicleId}) completed the emergency trip and case ${trip.caseId} is now marked completed. An optional feedback form is available on your dashboard.`
+          : `Ambulance (${trip.vehicleId}) status updated: ${note || status.replace('_', ' ')}.`,
         relatedCaseId: trip.caseId,
+        emergencyId: trip.caseId,
+        newStatus: status === 'completed' ? 'COMPLETED' : undefined,
         isRead: false,
         createdAt: now
       });
@@ -3607,6 +3640,37 @@ class DataStore {
 
   public addClinicalNote(note: ClinicalNote) {
     this.state.clinicalNotes.unshift(note);
+    this.saveState();
+  }
+
+  // --- Patient Feedback (Completed Cases) ---
+  public getFeedbackList(): CaseFeedback[] {
+    return [...(this.state.feedback || [])].sort(
+      (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
+    );
+  }
+
+  public getFeedbackForCase(caseId: string): CaseFeedback | undefined {
+    return (this.state.feedback || []).find((f) => f.caseId === caseId || f.id === caseId);
+  }
+
+  public getFeedbackForUser(userUid: string, linkedPatientUids: string[] = []): CaseFeedback[] {
+    const allowedUids = new Set([userUid, ...linkedPatientUids].filter(Boolean));
+    return (this.state.feedback || [])
+      .filter((f) => allowedUids.has(f.patientUid) || f.submittedByUid === userUid)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  }
+
+  public saveFeedbackLocal(record: CaseFeedback) {
+    if (!Array.isArray(this.state.feedback)) {
+      this.state.feedback = [];
+    }
+    const existingIdx = this.state.feedback.findIndex((f) => f.caseId === record.caseId);
+    if (existingIdx >= 0) {
+      this.state.feedback[existingIdx] = record;
+    } else {
+      this.state.feedback.unshift(record);
+    }
     this.saveState();
   }
 }
@@ -4449,4 +4513,641 @@ export async function markAllNotificationsReadInFirestore(recipientUid: string):
     });
     await batch.commit();
   }
+}
+
+// ==========================================
+// PATIENT FEEDBACK SERVICE (COMPLETED CASES)
+// ==========================================
+
+export function isCaseCompletedStatus(status?: string): boolean {
+  const normalized = String(status || '').trim().toUpperCase();
+  return normalized === 'COMPLETED' || normalized === 'RESOLVED';
+}
+
+export function isAmbulanceApplicableForCase(
+  emergencyCase: Omit<Partial<EmergencyCase>, 'status'> & {
+    status?: string;
+    resourcesList?: string[];
+    individualStatuses?: Array<{ resource: string; detail: string; status: string; code?: string }>;
+  },
+  requests: ResourceRequest[] = [],
+  hasTrip = false
+): boolean {
+  if (hasTrip) return true;
+  if (emergencyCase.assignedAmbulanceUid || emergencyCase.assignedAmbulanceName) return true;
+  if (emergencyCase.quotas?.ambulanceRequired) return true;
+  if (
+    Array.isArray(emergencyCase.resourcesNeeded) &&
+    emergencyCase.resourcesNeeded.some((r) => String(r).toLowerCase().includes('ambulance'))
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(emergencyCase.requiredServices) &&
+    emergencyCase.requiredServices.some((s) => String(s).toLowerCase().includes('ambulance'))
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(emergencyCase.resourcesList) &&
+    emergencyCase.resourcesList.some((r) => String(r).toLowerCase().includes('ambulance'))
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(emergencyCase.individualStatuses) &&
+    emergencyCase.individualStatuses.some((s) => String(s.resource || '').toLowerCase().includes('ambulance'))
+  ) {
+    return true;
+  }
+  if (
+    requests.some(
+      (r) =>
+        (!emergencyCase.caseId || r.caseId === emergencyCase.caseId) &&
+        String(r.resourceType || '').toLowerCase().includes('ambulance')
+    )
+  ) {
+    return true;
+  }
+  if (emergencyCase.caseId && dataStore.getTripForCase(emergencyCase.caseId)) {
+    return true;
+  }
+  return false;
+}
+
+const GENERIC_PROVIDER_NAMES = new Set([
+  '',
+  'not assigned',
+  'carebridge emergency network',
+  'pending coordinator assignment'
+]);
+
+const isMeaningfulProviderName = (name?: string): name is string => {
+  if (!name) return false;
+  const trimmed = name.trim();
+  return trimmed.length > 0 && !GENERIC_PROVIDER_NAMES.has(trimmed.toLowerCase());
+};
+
+export function extractFeedbackProviderMetadata(
+  emergencyCase: Omit<Partial<EmergencyCase>, 'status'> & { status?: string; providerName?: string },
+  requests: ResourceRequest[] = []
+): {
+  hospitalUid?: string;
+  hospitalName?: string;
+  ambulanceUid?: string;
+  ambulanceName?: string;
+  providerUids: string[];
+  providerNames: string[];
+  providers: CaseFeedbackProviderRef[];
+} {
+  const caseRequests = requests.filter((r) => !emergencyCase.caseId || r.caseId === emergencyCase.caseId);
+  const providersMap = new Map<string, CaseFeedbackProviderRef>();
+
+  const registerProvider = (uid: string | undefined, name: string | undefined, role: string) => {
+    const cleanUid = uid && uid !== 'pending_coordinator_assignment' ? uid.trim() : undefined;
+    const cleanName = isMeaningfulProviderName(name) ? name.trim() : undefined;
+    if (!cleanUid && !cleanName) return;
+    const key = cleanUid ? `${role}:${cleanUid}` : `${role}:${(cleanName || '').toLowerCase()}`;
+    if (!providersMap.has(key)) {
+      providersMap.set(key, {
+        ...(cleanUid ? { uid: cleanUid } : {}),
+        name: cleanName || cleanUid || role,
+        role
+      });
+    } else if (cleanName && !isMeaningfulProviderName(providersMap.get(key)?.name)) {
+      providersMap.set(key, {
+        ...(cleanUid ? { uid: cleanUid } : {}),
+        name: cleanName,
+        role
+      });
+    }
+  };
+
+  let hospitalUid = emergencyCase.assignedHospitalUid;
+  let hospitalName = isMeaningfulProviderName(emergencyCase.assignedHospitalName)
+    ? emergencyCase.assignedHospitalName.trim()
+    : isMeaningfulProviderName(emergencyCase.matchedHospitalName)
+      ? emergencyCase.matchedHospitalName.trim()
+      : undefined;
+
+  let ambulanceUid = emergencyCase.assignedAmbulanceUid;
+  let ambulanceName = isMeaningfulProviderName(emergencyCase.assignedAmbulanceName)
+    ? emergencyCase.assignedAmbulanceName.trim()
+    : undefined;
+
+  caseRequests.forEach((req) => {
+    const reqUid = req.providerUid && req.providerUid !== 'pending_coordinator_assignment' ? req.providerUid : undefined;
+    const reqName = isMeaningfulProviderName(req.providerName) ? req.providerName.trim() : undefined;
+    if (!reqUid && !reqName) return;
+
+    if (['bed', 'icu', 'hospital_admission'].includes(req.resourceType)) {
+      if (!hospitalUid && reqUid) hospitalUid = reqUid;
+      if (!hospitalName && reqName) hospitalName = reqName;
+      registerProvider(reqUid, reqName, 'hospital');
+    } else if (req.resourceType === 'ambulance') {
+      if (!ambulanceUid && reqUid) ambulanceUid = reqUid;
+      if (!ambulanceName && reqName) ambulanceName = reqName;
+      registerProvider(reqUid, reqName, 'ambulanceProvider');
+    } else if (req.resourceType === 'blood') {
+      registerProvider(reqUid, reqName, 'bloodBank');
+    } else if (req.resourceType === 'oxygen') {
+      registerProvider(reqUid, reqName, 'oxygenProvider');
+    } else if (req.resourceType === 'doctor' || req.resourceType === 'doctor_assistance') {
+      registerProvider(reqUid, reqName, 'doctor');
+    }
+  });
+
+  if (hospitalUid || hospitalName) {
+    registerProvider(hospitalUid, hospitalName, 'hospital');
+  }
+  if (ambulanceUid || ambulanceName) {
+    registerProvider(ambulanceUid, ambulanceName, 'ambulanceProvider');
+  }
+  if (emergencyCase.assignedBloodBankUid || emergencyCase.assignedBloodBankName) {
+    registerProvider(emergencyCase.assignedBloodBankUid, emergencyCase.assignedBloodBankName, 'bloodBank');
+  }
+  if (emergencyCase.assignedOxygenUid || emergencyCase.assignedOxygenName) {
+    registerProvider(emergencyCase.assignedOxygenUid, emergencyCase.assignedOxygenName, 'oxygenProvider');
+  }
+
+  // Fallback to case.providerName only if no specific hospital/provider was registered
+  if (providersMap.size === 0 && isMeaningfulProviderName(emergencyCase.providerName)) {
+    hospitalName = emergencyCase.providerName.trim();
+    registerProvider(undefined, hospitalName, 'hospital');
+  }
+
+  const providers = Array.from(providersMap.values());
+  const providerUids = Array.from(new Set(providers.map((p) => p.uid).filter((v): v is string => Boolean(v))));
+  const providerNames = Array.from(new Set(providers.map((p) => p.name).filter((v) => v.length > 0)));
+
+  return {
+    ...(hospitalUid ? { hospitalUid } : {}),
+    ...(hospitalName ? { hospitalName } : {}),
+    ...(ambulanceUid ? { ambulanceUid } : {}),
+    ...(ambulanceName ? { ambulanceName } : {}),
+    providerUids,
+    providerNames,
+    providers
+  };
+}
+
+export interface CaseFeedbackSubmissionInput {
+  caseId: string;
+  caseStatus?: string;
+  patientUid: string;
+  patientName: string;
+  submittedByUid: string;
+  submittedByName: string;
+  submittedByRole: UserRole;
+  overallRating: number;
+  hospitalProviderRating: number;
+  ambulanceApplicable: boolean;
+  ambulanceRating?: number | null;
+  responseTimeSatisfaction: number;
+  comments?: string;
+  hospitalUid?: string;
+  hospitalName?: string;
+  ambulanceUid?: string;
+  ambulanceName?: string;
+  providerUids?: string[];
+  providerNames?: string[];
+  providers?: CaseFeedbackProviderRef[];
+  caseCompletedAt?: string;
+}
+
+const isValidRatingInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 5;
+
+export function validateCaseFeedbackInput(
+  input: CaseFeedbackSubmissionInput
+): { valid: boolean; errors: Record<string, string> } {
+  const errors: Record<string, string> = {};
+
+  if (!input.caseId || !input.caseId.trim()) {
+    errors.caseId = 'A valid Case ID is required.';
+  }
+  if (!isValidRatingInteger(input.overallRating)) {
+    errors.overallRating = 'Please provide an overall experience rating between 1 and 5 stars.';
+  }
+  if (!isValidRatingInteger(input.hospitalProviderRating)) {
+    errors.hospitalProviderRating = 'Please provide a hospital/provider service rating between 1 and 5 stars.';
+  }
+  if (input.ambulanceApplicable) {
+    if (!isValidRatingInteger(input.ambulanceRating)) {
+      errors.ambulanceRating = 'Please provide an ambulance service rating between 1 and 5 stars.';
+    }
+  }
+  if (!isValidRatingInteger(input.responseTimeSatisfaction)) {
+    errors.responseTimeSatisfaction = 'Please rate your response time satisfaction between 1 and 5 stars.';
+  }
+  if (input.comments && input.comments.trim().length > 2000) {
+    errors.comments = 'Comments and suggestions must be 2000 characters or fewer.';
+  }
+
+  return { valid: Object.keys(errors).length === 0, errors };
+}
+
+const normalizeCaseFeedback = (data: Record<string, unknown>, docId: string): CaseFeedback => {
+  const ambulanceApplicable = Boolean(data.ambulanceApplicable);
+  const rawAmbRating = data.ambulanceRating;
+  const ambulanceRating =
+    ambulanceApplicable && typeof rawAmbRating === 'number' && !Number.isNaN(rawAmbRating)
+      ? Math.round(rawAmbRating)
+      : null;
+
+  return {
+    id: typeof data.id === 'string' && data.id ? data.id : docId,
+    caseId: typeof data.caseId === 'string' && data.caseId ? data.caseId : docId,
+    patientUid: typeof data.patientUid === 'string' ? data.patientUid : '',
+    patientName: typeof data.patientName === 'string' ? data.patientName : 'Patient',
+    submittedByUid: typeof data.submittedByUid === 'string' ? data.submittedByUid : '',
+    submittedByName: typeof data.submittedByName === 'string' ? data.submittedByName : 'Patient',
+    submittedByRole: (typeof data.submittedByRole === 'string' ? data.submittedByRole : 'patient') as UserRole,
+    overallRating: typeof data.overallRating === 'number' ? Math.round(data.overallRating) : 0,
+    hospitalProviderRating: typeof data.hospitalProviderRating === 'number' ? Math.round(data.hospitalProviderRating) : 0,
+    ambulanceApplicable,
+    ambulanceRating,
+    responseTimeSatisfaction: typeof data.responseTimeSatisfaction === 'number' ? Math.round(data.responseTimeSatisfaction) : 0,
+    comments: typeof data.comments === 'string' ? data.comments : '',
+    hospitalUid: typeof data.hospitalUid === 'string' && data.hospitalUid ? data.hospitalUid : undefined,
+    hospitalName: typeof data.hospitalName === 'string' && data.hospitalName ? data.hospitalName : undefined,
+    ambulanceUid: typeof data.ambulanceUid === 'string' && data.ambulanceUid ? data.ambulanceUid : undefined,
+    ambulanceName: typeof data.ambulanceName === 'string' && data.ambulanceName ? data.ambulanceName : undefined,
+    providerUids: Array.isArray(data.providerUids) ? data.providerUids.filter((v): v is string => typeof v === 'string') : [],
+    providerNames: Array.isArray(data.providerNames) ? data.providerNames.filter((v): v is string => typeof v === 'string') : [],
+    providers: Array.isArray(data.providers) ? (data.providers as CaseFeedbackProviderRef[]) : [],
+    caseCompletedAt: data.caseCompletedAt ? firestoreDateToIso(data.caseCompletedAt) : undefined,
+    createdAt: firestoreDateToIso(data.createdAt)
+  };
+};
+
+export async function submitCaseFeedbackToFirestore(
+  input: CaseFeedbackSubmissionInput
+): Promise<CaseFeedback> {
+  const validation = validateCaseFeedbackInput(input);
+  if (!validation.valid) {
+    const firstError = Object.values(validation.errors)[0] || 'Invalid feedback submission.';
+    throw new Error(firstError);
+  }
+
+  const caseId = input.caseId.trim();
+  const trimmedComments = (input.comments || '').trim();
+  const nowIso = new Date().toISOString();
+  const ambulanceRating = input.ambulanceApplicable ? Math.round(input.ambulanceRating as number) : null;
+
+  const baseRecord: CaseFeedback = {
+    id: caseId,
+    caseId,
+    patientUid: input.patientUid,
+    patientName: input.patientName || 'Patient',
+    submittedByUid: input.submittedByUid,
+    submittedByName: input.submittedByName || input.patientName || 'Patient',
+    submittedByRole: input.submittedByRole || 'patient',
+    overallRating: Math.round(input.overallRating),
+    hospitalProviderRating: Math.round(input.hospitalProviderRating),
+    ambulanceApplicable: Boolean(input.ambulanceApplicable),
+    ambulanceRating,
+    responseTimeSatisfaction: Math.round(input.responseTimeSatisfaction),
+    comments: trimmedComments,
+    ...(input.hospitalUid ? { hospitalUid: input.hospitalUid } : {}),
+    ...(input.hospitalName ? { hospitalName: input.hospitalName } : {}),
+    ...(input.ambulanceUid ? { ambulanceUid: input.ambulanceUid } : {}),
+    ...(input.ambulanceName ? { ambulanceName: input.ambulanceName } : {}),
+    providerUids: Array.from(new Set((input.providerUids || []).filter(Boolean))),
+    providerNames: Array.from(new Set((input.providerNames || []).filter(Boolean))),
+    providers: input.providers || [],
+    ...(input.caseCompletedAt ? { caseCompletedAt: input.caseCompletedAt } : {}),
+    createdAt: nowIso
+  };
+
+  if (isFirebaseConfigured && db && auth?.currentUser) {
+    const caseRef = doc(db, 'cases', caseId);
+    const feedbackRef = doc(db, 'feedback', caseId);
+    const submitterUid = auth.currentUser.uid;
+
+    let resolvedPatientUid = baseRecord.patientUid;
+
+    await runTransaction(db, async (transaction) => {
+      const [caseSnap, existingFeedbackSnap] = await Promise.all([
+        transaction.get(caseRef),
+        transaction.get(feedbackRef)
+      ]);
+
+      if (!caseSnap.exists()) {
+        throw new Error(`Emergency case ${caseId} could not be found.`);
+      }
+      const caseData = caseSnap.data();
+      if (!isCaseCompletedStatus(String(caseData.status || ''))) {
+        throw new Error('Feedback can only be submitted once the emergency case reaches Completed status.');
+      }
+      if (existingFeedbackSnap.exists()) {
+        throw new Error('Feedback has already been submitted for this completed case.');
+      }
+
+      resolvedPatientUid = typeof caseData.patientUid === 'string' && caseData.patientUid
+        ? caseData.patientUid
+        : baseRecord.patientUid;
+
+      const firestorePayload: Record<string, unknown> = {
+        id: caseId,
+        caseId,
+        patientUid: resolvedPatientUid,
+        patientName: baseRecord.patientName,
+        submittedByUid: submitterUid,
+        submittedByName: baseRecord.submittedByName,
+        submittedByRole: baseRecord.submittedByRole,
+        overallRating: baseRecord.overallRating,
+        hospitalProviderRating: baseRecord.hospitalProviderRating,
+        ambulanceApplicable: baseRecord.ambulanceApplicable,
+        ambulanceRating: baseRecord.ambulanceRating,
+        responseTimeSatisfaction: baseRecord.responseTimeSatisfaction,
+        comments: baseRecord.comments,
+        providerUids: baseRecord.providerUids,
+        providerNames: baseRecord.providerNames,
+        providers: baseRecord.providers,
+        createdAt: serverTimestamp()
+      };
+      if (baseRecord.hospitalUid) firestorePayload.hospitalUid = baseRecord.hospitalUid;
+      if (baseRecord.hospitalName) firestorePayload.hospitalName = baseRecord.hospitalName;
+      if (baseRecord.ambulanceUid) firestorePayload.ambulanceUid = baseRecord.ambulanceUid;
+      if (baseRecord.ambulanceName) firestorePayload.ambulanceName = baseRecord.ambulanceName;
+      if (baseRecord.caseCompletedAt) firestorePayload.caseCompletedAt = baseRecord.caseCompletedAt;
+
+      transaction.set(feedbackRef, firestorePayload);
+    });
+
+    const savedRecord: CaseFeedback = {
+      ...baseRecord,
+      patientUid: resolvedPatientUid,
+      submittedByUid: submitterUid
+    };
+    dataStore.saveFeedbackLocal(savedRecord);
+    return savedRecord;
+  }
+
+  // Local / Demo Store path (also enforces completed-only & single submission per case)
+  const localCase = dataStore.getCase(caseId);
+  const effectiveStatus = localCase?.status || input.caseStatus;
+  if (!isCaseCompletedStatus(effectiveStatus)) {
+    throw new Error('Feedback can only be submitted once the emergency case reaches Completed status.');
+  }
+  if (dataStore.getFeedbackForCase(caseId)) {
+    throw new Error('Feedback has already been submitted for this completed case.');
+  }
+
+  dataStore.saveFeedbackLocal(baseRecord);
+  return baseRecord;
+}
+
+export function subscribeFeedbackForPatientFromFirestore(
+  userUid: string,
+  linkedPatientUids: string[] = [],
+  onUpdate: (items: CaseFeedback[]) => void,
+  onError?: (message: string) => void
+): Unsubscribe {
+  const firestoreMap = new Map<string, CaseFeedback>();
+
+  const emitCombined = () => {
+    const combined = new Map<string, CaseFeedback>();
+    dataStore.getFeedbackForUser(userUid, linkedPatientUids).forEach((item) => {
+      combined.set(item.caseId, item);
+    });
+    firestoreMap.forEach((item) => {
+      combined.set(item.caseId, item);
+    });
+    const sorted = Array.from(combined.values()).sort(
+      (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
+    );
+    onUpdate(sorted);
+  };
+
+  emitCombined();
+  const unsubStore = dataStore.subscribe(emitCombined);
+
+  if (!isFirebaseConfigured || !db || !auth?.currentUser) {
+    return unsubStore;
+  }
+
+  const unsubs: Unsubscribe[] = [unsubStore];
+  const handleSnap = (snapshot: any) => {
+    snapshot.docs.forEach((docSnap: any) => {
+      const normalized = normalizeCaseFeedback(docSnap.data(), docSnap.id);
+      firestoreMap.set(normalized.caseId, normalized);
+      dataStore.saveFeedbackLocal(normalized);
+    });
+    emitCombined();
+  };
+
+  const handleErr = (err: any) => {
+    if (onError) onError(`Could not load feedback records: ${err?.message || 'Unknown error'}`);
+  };
+
+  const patientUidsToWatch = Array.from(new Set([userUid, ...linkedPatientUids].filter(Boolean)));
+  patientUidsToWatch.forEach((pUid) => {
+    unsubs.push(
+      onSnapshot(
+        query(collection(db, 'feedback'), where('patientUid', '==', pUid)),
+        handleSnap,
+        handleErr
+      )
+    );
+  });
+  unsubs.push(
+    onSnapshot(
+      query(collection(db, 'feedback'), where('submittedByUid', '==', userUid)),
+      handleSnap,
+      handleErr
+    )
+  );
+
+  return () => {
+    unsubs.forEach((unsub) => {
+      try {
+        unsub();
+      } catch (e) {}
+    });
+  };
+}
+
+export function subscribeAllFeedbackFromFirestore(
+  onUpdate: (items: CaseFeedback[]) => void,
+  onError?: (message: string) => void
+): Unsubscribe {
+  const firestoreMap = new Map<string, CaseFeedback>();
+  let hasFirestoreData = false;
+
+  const emitCombined = () => {
+    const combined = new Map<string, CaseFeedback>();
+    if (!isFirebaseConfigured || !db || !auth?.currentUser || !hasFirestoreData) {
+      dataStore.getFeedbackList().forEach((item) => combined.set(item.caseId, item));
+    }
+    firestoreMap.forEach((item) => combined.set(item.caseId, item));
+    const sorted = Array.from(combined.values()).sort(
+      (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
+    );
+    onUpdate(sorted);
+  };
+
+  emitCombined();
+  const unsubStore = dataStore.subscribe(emitCombined);
+
+  if (!isFirebaseConfigured || !db || !auth?.currentUser) {
+    return unsubStore;
+  }
+
+  const unsubFirestore = onSnapshot(
+    collection(db, 'feedback'),
+    (snapshot) => {
+      hasFirestoreData = true;
+      firestoreMap.clear();
+      snapshot.docs.forEach((docSnap) => {
+        const normalized = normalizeCaseFeedback(docSnap.data(), docSnap.id);
+        firestoreMap.set(normalized.caseId, normalized);
+      });
+      emitCombined();
+    },
+    (error) => {
+      if (onError) onError(`Could not load patient feedback: ${error.message}`);
+    }
+  );
+
+  return () => {
+    unsubStore();
+    unsubFirestore();
+  };
+}
+
+export interface FeedbackAveragesSummary {
+  totalCount: number;
+  overallAvg: number | null;
+  hospitalProviderAvg: number | null;
+  ambulanceAvg: number | null;
+  ambulanceResponseCount: number;
+  responseTimeAvg: number | null;
+}
+
+export function calculateFeedbackAverages(feedbackList: CaseFeedback[]): FeedbackAveragesSummary {
+  const totalCount = feedbackList.length;
+  if (totalCount === 0) {
+    return {
+      totalCount: 0,
+      overallAvg: null,
+      hospitalProviderAvg: null,
+      ambulanceAvg: null,
+      ambulanceResponseCount: 0,
+      responseTimeAvg: null
+    };
+  }
+
+  const roundOne = (sum: number, count: number) =>
+    count > 0 ? Math.round((sum / count) * 10) / 10 : null;
+
+  let overallSum = 0;
+  let hospitalSum = 0;
+  let responseSum = 0;
+  let ambulanceSum = 0;
+  let ambulanceCount = 0;
+
+  for (const item of feedbackList) {
+    overallSum += item.overallRating;
+    hospitalSum += item.hospitalProviderRating;
+    responseSum += item.responseTimeSatisfaction;
+    if (item.ambulanceApplicable && typeof item.ambulanceRating === 'number' && item.ambulanceRating >= 1) {
+      ambulanceSum += item.ambulanceRating;
+      ambulanceCount += 1;
+    }
+  }
+
+  return {
+    totalCount,
+    overallAvg: roundOne(overallSum, totalCount),
+    hospitalProviderAvg: roundOne(hospitalSum, totalCount),
+    ambulanceAvg: roundOne(ambulanceSum, ambulanceCount),
+    ambulanceResponseCount: ambulanceCount,
+    responseTimeAvg: roundOne(responseSum, totalCount)
+  };
+}
+
+export interface FeedbackFilterCriteria {
+  provider?: string;
+  hospital?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  search?: string;
+}
+
+export function filterCaseFeedback(
+  feedbackList: CaseFeedback[],
+  filters: FeedbackFilterCriteria
+): CaseFeedback[] {
+  const providerFilter = (filters.provider || '').trim().toLowerCase();
+  const hospitalFilter = (filters.hospital || '').trim().toLowerCase();
+  const dateFrom = (filters.dateFrom || '').trim();
+  const dateTo = (filters.dateTo || '').trim();
+  const search = (filters.search || '').trim().toLowerCase();
+
+  return feedbackList.filter((item) => {
+    if (providerFilter && providerFilter !== 'all') {
+      const matchesProviderUid = item.providerUids.some((uid) => uid.toLowerCase() === providerFilter);
+      const matchesProviderName = item.providerNames.some((name) => name.toLowerCase() === providerFilter);
+      const matchesStructured = item.providers.some(
+        (p) =>
+          (p.uid && p.uid.toLowerCase() === providerFilter) ||
+          p.name.toLowerCase() === providerFilter
+      );
+      const matchesHospital =
+        (item.hospitalUid && item.hospitalUid.toLowerCase() === providerFilter) ||
+        (item.hospitalName && item.hospitalName.toLowerCase() === providerFilter);
+      const matchesAmb =
+        (item.ambulanceUid && item.ambulanceUid.toLowerCase() === providerFilter) ||
+        (item.ambulanceName && item.ambulanceName.toLowerCase() === providerFilter);
+
+      if (!matchesProviderUid && !matchesProviderName && !matchesStructured && !matchesHospital && !matchesAmb) {
+        return false;
+      }
+    }
+
+    if (hospitalFilter && hospitalFilter !== 'all') {
+      const matchesHospitalUid = item.hospitalUid && item.hospitalUid.toLowerCase() === hospitalFilter;
+      const matchesHospitalName = item.hospitalName && item.hospitalName.toLowerCase() === hospitalFilter;
+      const matchesHospitalInProviders = item.providers.some(
+        (p) =>
+          p.role === 'hospital' &&
+          ((p.uid && p.uid.toLowerCase() === hospitalFilter) || p.name.toLowerCase() === hospitalFilter)
+      );
+      if (!matchesHospitalUid && !matchesHospitalName && !matchesHospitalInProviders) {
+        return false;
+      }
+    }
+
+    if (dateFrom || dateTo) {
+      const createdDateStr = (item.createdAt || '').slice(0, 10);
+      if (dateFrom && (!createdDateStr || createdDateStr < dateFrom)) {
+        return false;
+      }
+      if (dateTo && (!createdDateStr || createdDateStr > dateTo)) {
+        return false;
+      }
+    }
+
+    if (search) {
+      const haystack = [
+        item.caseId,
+        item.patientName,
+        item.submittedByName,
+        item.hospitalName,
+        item.ambulanceName,
+        ...item.providerNames,
+        item.comments
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      if (!haystack.includes(search)) {
+        return false;
+      }
+    }
+
+    return true;
+  });
 }

@@ -1219,6 +1219,100 @@ try {
     assert.equal(caseRead.status, 403, JSON.stringify(caseRead.data));
   });
 
+  await check('Patient feedback is allowed only once per completed case and restricted to patient, active attendant, and admin', async () => {
+    const activeFeedbackCaseId = `${caseId}-FB-ACTIVE`;
+    const completedFeedbackCaseId = `${caseId}-FB-COMPLETED`;
+    await seed(`cases/${activeFeedbackCaseId}`, {
+      ...caseDocument,
+      caseId: activeFeedbackCaseId,
+      status: 'IN_PROGRESS'
+    });
+    await seed(`cases/${completedFeedbackCaseId}`, {
+      ...caseDocument,
+      caseId: completedFeedbackCaseId,
+      status: 'COMPLETED',
+      assignedHospitalUid: hospitalProvider.uid,
+      assignedHospitalName: 'Rules Test Hospital'
+    });
+
+    const feedbackWrite = (targetCaseId, submitterUid, overrides = {}) => ({
+      update: {
+        name: `projects/${projectId}/databases/(default)/documents/feedback/${targetCaseId}`,
+        fields: encodedFields({
+          id: targetCaseId,
+          caseId: targetCaseId,
+          patientUid: patient.uid,
+          patientName: 'Rules Test Patient',
+          submittedByUid: submitterUid,
+          submittedByName: 'Rules Test Patient',
+          submittedByRole: 'patient',
+          overallRating: 5,
+          hospitalProviderRating: 4,
+          ambulanceApplicable: true,
+          ambulanceRating: 5,
+          responseTimeSatisfaction: 4,
+          comments: 'Prompt emergency coordination and supportive hospital team.',
+          hospitalUid: hospitalProvider.uid,
+          hospitalName: 'Rules Test Hospital',
+          providerUids: [hospitalProvider.uid],
+          providerNames: ['Rules Test Hospital'],
+          providers: [{ uid: hospitalProvider.uid, name: 'Rules Test Hospital', role: 'hospital' }],
+          ...overrides
+        })
+      },
+      updateTransforms: [
+        { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }
+      ]
+    });
+
+    // Cannot submit feedback before case is marked completed
+    const prematureResult = await batchCommit(patient.token, [
+      feedbackWrite(activeFeedbackCaseId, patient.uid)
+    ]);
+    assert.equal(prematureResult.status, 403, JSON.stringify(prematureResult.data));
+
+    // Stranger cannot submit feedback for another patient's completed case
+    const strangerSubmit = await batchCommit(stranger.token, [
+      feedbackWrite(completedFeedbackCaseId, stranger.uid)
+    ]);
+    assert.equal(strangerSubmit.status, 403, JSON.stringify(strangerSubmit.data));
+
+    // Invalid star rating (>5) rejected
+    const invalidRating = await batchCommit(patient.token, [
+      feedbackWrite(completedFeedbackCaseId, patient.uid, { overallRating: 6 })
+    ]);
+    assert.equal(invalidRating.status, 403, JSON.stringify(invalidRating.data));
+
+    // Missing ambulance rating when ambulanceApplicable is true rejected
+    const missingAmbRating = await batchCommit(patient.token, [
+      feedbackWrite(completedFeedbackCaseId, patient.uid, { ambulanceApplicable: true, ambulanceRating: null })
+    ]);
+    assert.equal(missingAmbRating.status, 403, JSON.stringify(missingAmbRating.data));
+
+    // Valid feedback submission for completed case succeeds
+    const validSubmit = await batchCommit(patient.token, [
+      feedbackWrite(completedFeedbackCaseId, patient.uid)
+    ]);
+    expectSuccess(validSubmit, 'Valid feedback submission for completed case');
+
+    // Second submission / update for same completed case is strictly rejected (1 per case)
+    const duplicateSubmit = await batchCommit(patient.token, [
+      feedbackWrite(completedFeedbackCaseId, patient.uid, { overallRating: 2, comments: 'Overwrite attempt' })
+    ]);
+    assert.equal(duplicateSubmit.status, 403, JSON.stringify(duplicateSubmit.data));
+
+    // Patient and Admin can read feedback; stranger cannot
+    const patientRead = await read(`feedback/${completedFeedbackCaseId}`, patient.token);
+    const adminRead = await read(`feedback/${completedFeedbackCaseId}`, admin.token);
+    const adminList = await runQuery({ from: [{ collectionId: 'feedback' }] }, admin.token);
+    const strangerRead = await read(`feedback/${completedFeedbackCaseId}`, stranger.token);
+    expectSuccess(patientRead, 'Patient reads own feedback');
+    expectSuccess(adminRead, 'Admin reads submitted feedback');
+    expectSuccess(adminList, 'Admin lists all submitted feedback');
+    assert.ok(adminList.data.some((item) => item.document?.fields?.caseId?.stringValue === completedFeedbackCaseId));
+    assert.equal(strangerRead.status, 403, JSON.stringify(strangerRead.data));
+  });
+
   console.log(`\nFirestore Rules Emulator tests: ${passed.length} passed.`);
 } catch (error) {
   console.error(`FAIL: ${error?.stack || error}`);

@@ -390,6 +390,10 @@ export interface HospitalProfile {
   city: string;
   state: string;
   address: string;
+  coordinates?: {
+    lat: number;
+    lng: number;
+  };
   isVerified: boolean;
   lastUpdated: string;
 }
@@ -405,6 +409,10 @@ export interface BloodBankProfile {
   city: string;
   state: string;
   address: string;
+  coordinates?: {
+    lat: number;
+    lng: number;
+  };
   isVerified: boolean;
   lastUpdated: string;
 }
@@ -420,6 +428,10 @@ export interface OxygenProfile {
   city: string;
   state: string;
   address: string;
+  coordinates?: {
+    lat: number;
+    lng: number;
+  };
   isVerified: boolean;
   lastUpdated: string;
 }
@@ -441,6 +453,10 @@ export interface AmbulanceProfile {
   city: string;
   state: string;
   address: string;
+  coordinates?: {
+    lat: number;
+    lng: number;
+  };
   isVerified: boolean;
   vehicles: AmbulanceVehicle[];
   lastUpdated: string;
@@ -465,6 +481,7 @@ export interface NotificationItem {
     | 'provider_data_updated'
     | 'provider_update_approved'
     | 'provider_update_rejected'
+    | 'feedback_available'
     | 'system_alert';
   title: string;
   message: string;
@@ -512,4 +529,35 @@ export interface ProviderUpdateRequest {
   adminNote?: string;
   reviewedByUid?: string;
   reviewedAt?: string;
+}
+
+export interface CaseFeedbackProviderRef {
+  uid?: string;
+  name: string;
+  role: string;
+}
+
+export interface CaseFeedback {
+  id: string; // Equal to caseId (guarantees at most one submission per completed case)
+  caseId: string;
+  patientUid: string;
+  patientName: string;
+  submittedByUid: string;
+  submittedByName: string;
+  submittedByRole: UserRole;
+  overallRating: number; // 1-5 stars
+  hospitalProviderRating: number; // 1-5 stars
+  ambulanceApplicable: boolean;
+  ambulanceRating: number | null; // 1-5 stars when applicable, null otherwise
+  responseTimeSatisfaction: number; // 1-5 stars
+  comments: string;
+  hospitalUid?: string;
+  hospitalName?: string;
+  ambulanceUid?: string;
+  ambulanceName?: string;
+  providerUids: string[];
+  providerNames: string[];
+  providers: CaseFeedbackProviderRef[];
+  caseCompletedAt?: string;
+  createdAt: string;
 }

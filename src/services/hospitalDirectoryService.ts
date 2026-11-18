@@ -4,8 +4,16 @@
  * and Google Maps integration for multiple locations.
  */
 
+import type {
+  HospitalProfile,
+  BloodBankProfile,
+  OxygenProfile,
+  AmbulanceProfile
+} from '../types';
+
 export interface HospitalProvider {
   id: string;
+  firestoreUid?: string;
   name: string;
   type: string;
   city: string;
@@ -25,6 +33,8 @@ export interface HospitalProvider {
     totalBeds: number;
     icu: number;
     totalIcu: number;
+    ventilators?: number;
+    totalVentilators?: number;
     bloodGroups: string[];
     bloodUnits: number;
     oxygenTanks: number;
@@ -34,6 +44,53 @@ export interface HospitalProvider {
   latestUpdate: string;
   details: string;
   isEmergency24x7: boolean;
+  isLiveFirestoreData?: boolean;
+  isVerified?: boolean;
+  withinSearchRadius?: boolean;
+  isEligible?: boolean;
+  missingResources?: string[];
+}
+
+export interface NearbyEmergencyResource {
+  id: string;
+  name: string;
+  resourceKind: 'bloodBank' | 'oxygenProvider' | 'ambulanceProvider';
+  address: string;
+  city: string;
+  phone: string;
+  coordinates: {
+    lat: number;
+    lng: number;
+  };
+  distanceKm: number;
+  etaMins: number;
+  withinSearchRadius: boolean;
+  availabilitySummary: string;
+  isAvailable: boolean;
+  isLiveFirestoreData: boolean;
+  lastUpdated: string;
+}
+
+export const DEFAULT_SEARCH_RADIUS_KM = 2;
+
+export interface GpsLocationReading {
+  lat: number;
+  lng: number;
+  accuracyMeters: number | null;
+  source: 'gps' | 'manual_coordinates' | 'manual_address';
+  label?: string;
+  capturedAt: string;
+}
+
+export type GpsAccuracyTier = 'good' | 'caution' | 'poor' | 'manual';
+
+export interface GpsAccuracyAssessment {
+  tier: GpsAccuracyTier;
+  accuracyMeters: number | null;
+  label: string;
+  message: string;
+  canClaimPrecise2Km: boolean;
+  recommendManualOrRetry: boolean;
 }
 
 export const POPULAR_LOCATIONS = [
@@ -915,18 +972,538 @@ function generateDynamicNearbyHospitals(locationQuery: string): HospitalProvider
 }
 
 /**
- * Calculates distance in kilometers between two lat/lng coordinates (Haversine formula)
+ * Calculates geographical distance in kilometers between two lat/lng coordinates (Haversine formula)
  */
-function getDistanceFromLatLonInKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371; // Earth's radius in km
+export function calculateHaversineDistanceKm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const R = 6371; // Earth's mean radius in km
   const dLat = (lat2 - lat1) * (Math.PI / 180);
   const dLon = (lon2 - lon1) * (Math.PI / 180);
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    Math.cos(lat1 * (Math.PI / 180)) *
+      Math.cos(lat2 * (Math.PI / 180)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+function getDistanceFromLatLonInKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  return calculateHaversineDistanceKm(lat1, lon1, lat2, lon2);
+}
+
+export function formatDistanceKm(distanceKm: number): string {
+  if (!Number.isFinite(distanceKm) || distanceKm < 0) return '—';
+  if (distanceKm < 1) {
+    const meters = Math.round(distanceKm * 1000);
+    return `${meters} m (${distanceKm.toFixed(2)} km)`;
+  }
+  return `${distanceKm.toFixed(2)} km`;
+}
+
+export function formatAccuracyMeters(accuracyMeters: number): string {
+  if (!Number.isFinite(accuracyMeters) || accuracyMeters < 0) return 'Unknown';
+  if (accuracyMeters >= 1000) {
+    return `±${(accuracyMeters / 1000).toFixed(2)} km (${Math.round(accuracyMeters)} m)`;
+  }
+  return `±${Math.round(accuracyMeters)} m`;
+}
+
+/**
+ * Separately evaluates device GPS accuracy (distinct from the 2 km search radius).
+ * - <= 50 m: good location estimate
+ * - 50 m < accuracy <= 500 m: usable with caution
+ * - > 500 m: poor accuracy — do not claim a precise 2 km location; prompt retry or manual address
+ */
+export function assessGpsAccuracy(
+  accuracyMeters: number | null | undefined,
+  source: GpsLocationReading['source'] = 'gps'
+): GpsAccuracyAssessment {
+  if (source !== 'gps' || accuracyMeters === null || accuracyMeters === undefined || !Number.isFinite(accuracyMeters)) {
+    return {
+      tier: 'manual',
+      accuracyMeters: null,
+      label: source === 'manual_coordinates' ? 'Manual Coordinates Entered' : 'Manual Address Coordinates',
+      message:
+        'Distances are calculated geographically from the coordinates for your manually entered location (2 km search radius).',
+      canClaimPrecise2Km: false,
+      recommendManualOrRetry: false
+    };
+  }
+
+  const rounded = Math.max(1, Math.round(accuracyMeters));
+
+  if (rounded <= 50) {
+    return {
+      tier: 'good',
+      accuracyMeters: rounded,
+      label: `Good GPS accuracy (${formatAccuracyMeters(rounded)})`,
+      message:
+        'Good location estimate. Geographical distances and the 2 km search radius around your position are reliable.',
+      canClaimPrecise2Km: true,
+      recommendManualOrRetry: false
+    };
+  }
+
+  if (rounded <= 500) {
+    return {
+      tier: 'caution',
+      accuracyMeters: rounded,
+      label: `Moderate GPS accuracy (${formatAccuracyMeters(rounded)}) — Usable with caution`,
+      message: `Your GPS reading has an uncertainty of ${formatAccuracyMeters(rounded)}. The 2 km search radius is approximate rather than exact — verify hospital distances or retry GPS for a tighter fix.`,
+      canClaimPrecise2Km: false,
+      recommendManualOrRetry: false
+    };
+  }
+
+  return {
+    tier: 'poor',
+    accuracyMeters: rounded,
+    label: `Poor GPS accuracy (${formatAccuracyMeters(rounded)})`,
+    message: `Reported GPS accuracy is worse than 500 m (${formatAccuracyMeters(rounded)}), so a precise 2 km search around your exact position cannot be claimed. Retry GPS outdoors or enter your street address / coordinates manually below.`,
+    canClaimPrecise2Km: false,
+    recommendManualOrRetry: true
+  };
+}
+
+export function parseCoordinateString(input: string): { lat: number; lng: number } | null {
+  const match = (input || '').trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+  if (!match) return null;
+  const lat = Number(match[1]);
+  const lng = Number(match[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return null;
+  }
+  return { lat, lng };
+}
+
+const KNOWN_LOCATION_COORDS: Array<{ keywords: string[]; lat: number; lng: number; label: string }> = [
+  { keywords: ['vidyanagar', 'kims', 'pb road hubballi'], lat: 15.3524, lng: 75.1328, label: 'Vidyanagar, Hubballi, Karnataka' },
+  { keywords: ['hubballi', 'hubli'], lat: 15.3647, lng: 75.1240, label: 'Hubballi, Karnataka' },
+  { keywords: ['sattur', 'sdm dharwad'], lat: 15.4208, lng: 75.0384, label: 'Sattur, Dharwad, Karnataka' },
+  { keywords: ['dharwad'], lat: 15.4589, lng: 75.0078, label: 'Dharwad, Karnataka' },
+  { keywords: ['belagavi', 'belgaum'], lat: 15.8580, lng: 74.5050, label: 'Belagavi, Karnataka' },
+  { keywords: ['bengaluru', 'bangalore'], lat: 12.9634, lng: 77.5744, label: 'Bengaluru, Karnataka' },
+  { keywords: ['mysuru', 'mysore'], lat: 12.3120, lng: 76.6510, label: 'Mysuru, Karnataka' },
+  { keywords: ['mumbai', 'bandra', 'parel'], lat: 19.0515, lng: 72.8290, label: 'Mumbai, Maharashtra' },
+  { keywords: ['pune'], lat: 18.5308, lng: 73.8767, label: 'Pune, Maharashtra' },
+  { keywords: ['delhi', 'new delhi', 'aiims'], lat: 28.5672, lng: 77.2100, label: 'New Delhi, Delhi' }
+];
+
+const inferFallbackCoordinatesForAddress = (address?: string, city?: string): { lat: number; lng: number } | null => {
+  const combined = `${address || ''} ${city || ''}`.toLowerCase();
+  if (!combined.trim()) return null;
+  const hit = KNOWN_LOCATION_COORDS.find((loc) => loc.keywords.some((kw) => combined.includes(kw)));
+  return hit ? { lat: hit.lat, lng: hit.lng } : null;
+};
+
+/**
+ * Resolves a manual street address or coordinate string to actual geographic { lat, lng } coordinates.
+ * Uses OpenStreetMap Nominatim when online, with known regional coordinate reference fallback.
+ */
+export async function resolveManualAddressToCoordinates(
+  addressInput: string
+): Promise<{ lat: number; lng: number; resolvedLabel: string; source: 'manual_coordinates' | 'manual_address' } | null> {
+  const trimmed = (addressInput || '').trim();
+  if (!trimmed) return null;
+
+  const directCoords = parseCoordinateString(trimmed);
+  if (directCoords) {
+    return {
+      lat: directCoords.lat,
+      lng: directCoords.lng,
+      resolvedLabel: `${directCoords.lat.toFixed(5)}, ${directCoords.lng.toFixed(5)}`,
+      source: 'manual_coordinates'
+    };
+  }
+
+  // Try live Nominatim geocoding when running in a browser with network connectivity
+  if (typeof fetch === 'function') {
+    try {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 5000) : null;
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(trimmed)}`,
+        {
+          headers: { Accept: 'application/json' },
+          ...(controller ? { signal: controller.signal } : {})
+        }
+      );
+      if (timer) clearTimeout(timer);
+      if (response.ok) {
+        const results = (await response.json()) as Array<{ lat?: string; lon?: string; display_name?: string }>;
+        if (Array.isArray(results) && results.length > 0 && results[0].lat && results[0].lon) {
+          const lat = Number(results[0].lat);
+          const lng = Number(results[0].lon);
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            return {
+              lat,
+              lng,
+              resolvedLabel: results[0].display_name || trimmed,
+              source: 'manual_address'
+            };
+          }
+        }
+      }
+    } catch {
+      // Fall back to curated coordinate lookup if offline/blocked
+    }
+  }
+
+  const lower = trimmed.toLowerCase();
+  const known = KNOWN_LOCATION_COORDS.find((loc) => loc.keywords.some((kw) => lower.includes(kw)));
+  if (known) {
+    return {
+      lat: known.lat,
+      lng: known.lng,
+      resolvedLabel: known.label,
+      source: 'manual_address'
+    };
+  }
+
+  return null;
+}
+
+const formatRelativeLastUpdated = (iso?: string): string => {
+  if (!iso) return 'Live Firestore';
+  const parsed = Date.parse(iso);
+  if (Number.isNaN(parsed)) return 'Live Firestore';
+  const diffMins = Math.max(0, Math.round((Date.now() - parsed) / 60000));
+  if (diffMins < 1) return 'Just now (Firestore)';
+  if (diffMins < 60) return `${diffMins} min${diffMins === 1 ? '' : 's'} ago (Firestore)`;
+  const diffHours = Math.round(diffMins / 60);
+  if (diffHours < 24) return `${diffHours} hr${diffHours === 1 ? '' : 's'} ago (Firestore)`;
+  return new Date(parsed).toLocaleDateString();
+};
+
+const normalizeHospitalKey = (name: string): string =>
+  (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/**
+ * Merges indexed hospital coordinates with live Firestore HospitalProfile availability data.
+ * Any hospital present in Firestore updates its real-time general beds, ICU beds, ventilators,
+ * address, and timestamp; newly registered Firestore hospitals are included as selectable entries.
+ */
+export function mergeHospitalsWithFirestoreData(
+  firestoreHospitals: HospitalProfile[] = [],
+  baseDirectory: HospitalProvider[] = HOSPITAL_DIRECTORY
+): HospitalProvider[] {
+  const merged = baseDirectory.map((h) => ({
+    ...h,
+    availableResources: { ...h.availableResources }
+  }));
+
+  for (const fsHosp of firestoreHospitals) {
+    if (!fsHosp || !fsHosp.hospitalName) continue;
+    const normFsName = normalizeHospitalKey(fsHosp.hospitalName);
+    const existingIdx = merged.findIndex(
+      (h) =>
+        h.id === fsHosp.uid ||
+        h.firestoreUid === fsHosp.uid ||
+        normalizeHospitalKey(h.name) === normFsName
+    );
+
+    const liveBeds = Math.max(0, Number(fsHosp.availableBeds ?? 0));
+    const liveTotalBeds = Math.max(liveBeds, Number(fsHosp.totalBeds ?? 0));
+    const liveIcu = Math.max(0, Number(fsHosp.availableICU ?? 0));
+    const liveTotalIcu = Math.max(liveIcu, Number(fsHosp.totalICU ?? 0));
+    const liveVent = Math.max(0, Number(fsHosp.availableVentilators ?? 0));
+    const liveTotalVent = Math.max(liveVent, Number(fsHosp.totalVentilators ?? 0));
+
+    if (existingIdx >= 0) {
+      const existing = merged[existingIdx];
+      const nextCoords =
+        fsHosp.coordinates &&
+        Number.isFinite(fsHosp.coordinates.lat) &&
+        Number.isFinite(fsHosp.coordinates.lng)
+          ? fsHosp.coordinates
+          : existing.coordinates;
+      merged[existingIdx] = {
+        ...existing,
+        firestoreUid: fsHosp.uid,
+        name: fsHosp.hospitalName || existing.name,
+        address: fsHosp.address ? `${fsHosp.address}${fsHosp.city && !fsHosp.address.toLowerCase().includes(fsHosp.city.toLowerCase()) ? `, ${fsHosp.city}` : ''}` : existing.address,
+        city: fsHosp.city || existing.city,
+        state: fsHosp.state || existing.state,
+        phone: fsHosp.contactNumber || existing.phone,
+        coordinates: nextCoords,
+        availableResources: {
+          ...existing.availableResources,
+          beds: liveBeds,
+          totalBeds: liveTotalBeds,
+          icu: liveIcu,
+          totalIcu: liveTotalIcu,
+          ventilators: liveVent,
+          totalVentilators: liveTotalVent
+        },
+        latestUpdate: formatRelativeLastUpdated(fsHosp.lastUpdated),
+        details: `${liveBeds} General Beds, ${liveIcu} ICU Beds, ${liveVent} Ventilators (Live Firestore)`,
+        isLiveFirestoreData: true,
+        isVerified: fsHosp.isVerified
+      };
+    } else {
+      const coords =
+        fsHosp.coordinates &&
+        Number.isFinite(fsHosp.coordinates.lat) &&
+        Number.isFinite(fsHosp.coordinates.lng)
+          ? fsHosp.coordinates
+          : inferFallbackCoordinatesForAddress(fsHosp.address, fsHosp.city);
+      if (!coords) continue;
+
+      merged.push({
+        id: fsHosp.uid,
+        firestoreUid: fsHosp.uid,
+        name: fsHosp.hospitalName,
+        type: fsHosp.departments?.[0] || 'Registered Emergency Hospital',
+        city: fsHosp.city || 'Local',
+        state: fsHosp.state || '',
+        address: fsHosp.address
+          ? `${fsHosp.address}${fsHosp.city && !fsHosp.address.toLowerCase().includes(fsHosp.city.toLowerCase()) ? `, ${fsHosp.city}` : ''}`
+          : fsHosp.city || 'Address on file',
+        phone: fsHosp.contactNumber || '',
+        rating: fsHosp.isVerified ? 'Verified Provider' : 'Registered',
+        reviewCount: 0,
+        distanceKm: 0,
+        etaMins: 5,
+        coordinates: coords,
+        availableResources: {
+          beds: liveBeds,
+          totalBeds: liveTotalBeds,
+          icu: liveIcu,
+          totalIcu: liveTotalIcu,
+          ventilators: liveVent,
+          totalVentilators: liveTotalVent,
+          bloodGroups: [],
+          bloodUnits: 0,
+          oxygenTanks: 0,
+          ambulances: 0,
+          doctorsOnDuty: Math.max(1, fsHosp.departments?.length || 1)
+        },
+        latestUpdate: formatRelativeLastUpdated(fsHosp.lastUpdated),
+        details: `${liveBeds} General Beds, ${liveIcu} ICU Beds, ${liveVent} Ventilators (Live Firestore)`,
+        isEmergency24x7: (fsHosp.operatingHours || '').includes('24'),
+        isLiveFirestoreData: true,
+        isVerified: fsHosp.isVerified
+      });
+    }
+  }
+
+  return merged;
+}
+
+export interface CoordinateHospitalSearchResult {
+  origin: { lat: number; lng: number };
+  radiusKm: number;
+  eligibleWithinRadius: HospitalProvider[];
+  ineligibleWithinRadius: HospitalProvider[];
+  eligibleOutsideRadius: HospitalProvider[];
+  usedOutsideRadiusFallback: boolean;
+  displayedHospitals: HospitalProvider[];
+}
+
+/**
+ * Evaluates whether a hospital is eligible for the patient's selected resources.
+ * Hospitals without beds/ICU (e.g., standalone ambulance fleets) are excluded when beds or ICU are requested.
+ */
+export function evaluateHospitalEligibility(
+  hospital: HospitalProvider,
+  selectedResources?: Record<string, boolean>
+): { isEligible: boolean; missingResources: string[] } {
+  const missing: string[] = [];
+  const res = hospital.availableResources;
+  const reqBeds = Boolean(selectedResources?.beds);
+  const reqIcu = Boolean(selectedResources?.icu);
+  const reqBlood = Boolean(selectedResources?.blood);
+  const reqOxygen = Boolean(selectedResources?.oxygen);
+  const reqAmbulance = Boolean(selectedResources?.ambulance);
+
+  if (reqBeds && res.beds <= 0) missing.push('General Beds');
+  if (reqIcu && res.icu <= 0) missing.push('ICU Beds');
+
+  // Must be a hospital (have bed or ICU capacity) unless ONLY non-hospital resources are selected
+  const isHospitalFacility = res.totalBeds > 0 || res.totalIcu > 0 || res.beds > 0 || res.icu > 0;
+  if (!reqBeds && !reqIcu) {
+    if (!isHospitalFacility) {
+      const hasAnySelected =
+        (reqBlood && res.bloodUnits > 0) ||
+        (reqOxygen && res.oxygenTanks > 0) ||
+        (reqAmbulance && res.ambulances > 0);
+      if (!hasAnySelected) missing.push('Selected Emergency Resource');
+    }
+  } else if (!isHospitalFacility) {
+    if (!missing.includes('General Beds') && reqBeds) missing.push('General Beds');
+    if (!missing.includes('ICU Beds') && reqIcu) missing.push('ICU Beds');
+  }
+
+  return {
+    isEligible: missing.length === 0,
+    missingResources: missing
+  };
+}
+
+/**
+ * Finds eligible hospitals strictly by geographical coordinates & Haversine distance (no city-name matching).
+ * Primary search distance defaults to 2 km; if none are eligible within 2 km, offers closest eligible
+ * hospitals outside the 2 km radius so the patient is never left without options.
+ */
+export function findNearbyHospitalsByCoordinates(
+  originCoords: { lat: number; lng: number },
+  hospitals: HospitalProvider[],
+  selectedResources?: Record<string, boolean>,
+  radiusKm: number = DEFAULT_SEARCH_RADIUS_KM
+): CoordinateHospitalSearchResult {
+  const ranked = hospitals
+    .filter(
+      (h) =>
+        h.coordinates &&
+        Number.isFinite(h.coordinates.lat) &&
+        Number.isFinite(h.coordinates.lng)
+    )
+    .map((h) => {
+      const exactKm = calculateHaversineDistanceKm(
+        originCoords.lat,
+        originCoords.lng,
+        h.coordinates.lat,
+        h.coordinates.lng
+      );
+      const distanceKm = Number(exactKm.toFixed(2));
+      const etaMins = Math.max(2, Math.round(exactKm * 2.5));
+      const { isEligible, missingResources } = evaluateHospitalEligibility(h, selectedResources);
+      return {
+        ...h,
+        distanceKm,
+        etaMins,
+        withinSearchRadius: exactKm <= radiusKm,
+        isEligible,
+        missingResources
+      };
+    })
+    .sort((a, b) => a.distanceKm - b.distanceKm);
+
+  const eligibleWithinRadius = ranked.filter((h) => h.withinSearchRadius && h.isEligible);
+  const ineligibleWithinRadius = ranked.filter((h) => h.withinSearchRadius && !h.isEligible);
+  const eligibleOutsideRadius = ranked.filter((h) => !h.withinSearchRadius && h.isEligible);
+
+  const usedOutsideRadiusFallback =
+    eligibleWithinRadius.length === 0 && eligibleOutsideRadius.length > 0;
+
+  const displayedHospitals =
+    eligibleWithinRadius.length > 0
+      ? eligibleWithinRadius
+      : eligibleOutsideRadius.slice(0, 8);
+
+  return {
+    origin: originCoords,
+    radiusKm,
+    eligibleWithinRadius,
+    ineligibleWithinRadius,
+    eligibleOutsideRadius,
+    usedOutsideRadiusFallback,
+    displayedHospitals
+  };
+}
+
+/**
+ * Computes geographical distance for live Firestore Blood Banks, Oxygen Providers, and Ambulance Fleets.
+ */
+export function findNearbyFirestoreResourcesByCoordinates(
+  originCoords: { lat: number; lng: number },
+  bloodBanks: BloodBankProfile[] = [],
+  oxygenProfiles: OxygenProfile[] = [],
+  ambulanceProfiles: AmbulanceProfile[] = [],
+  radiusKm: number = DEFAULT_SEARCH_RADIUS_KM
+): {
+  withinRadius: NearbyEmergencyResource[];
+  outsideRadiusFallback: NearbyEmergencyResource[];
+} {
+  const items: NearbyEmergencyResource[] = [];
+
+  for (const bb of bloodBanks) {
+    const coords = bb.coordinates || inferFallbackCoordinatesForAddress(bb.address, bb.city);
+    if (!coords) continue;
+    const totalUnits = Object.values(bb.inventory || {}).reduce((acc, v) => acc + Math.max(0, Number(v) || 0), 0);
+    const availableGroups = Object.entries(bb.inventory || {})
+      .filter(([, count]) => Number(count) > 0)
+      .map(([g]) => g);
+    const dist = calculateHaversineDistanceKm(originCoords.lat, originCoords.lng, coords.lat, coords.lng);
+    items.push({
+      id: bb.uid,
+      name: bb.bankName,
+      resourceKind: 'bloodBank',
+      address: bb.address,
+      city: bb.city,
+      phone: bb.contactNumber,
+      coordinates: coords,
+      distanceKm: Number(dist.toFixed(2)),
+      etaMins: Math.max(2, Math.round(dist * 2.5)),
+      withinSearchRadius: dist <= radiusKm,
+      availabilitySummary:
+        totalUnits > 0
+          ? `${totalUnits} blood units (${availableGroups.slice(0, 4).join(', ')}${availableGroups.length > 4 ? '…' : ''})`
+          : 'Currently out of stock',
+      isAvailable: totalUnits > 0,
+      isLiveFirestoreData: true,
+      lastUpdated: formatRelativeLastUpdated(bb.lastUpdated)
+    });
+  }
+
+  for (const oxy of oxygenProfiles) {
+    const coords = oxy.coordinates || inferFallbackCoordinatesForAddress(oxy.address, oxy.city);
+    if (!coords) continue;
+    const cyl = Math.max(0, Number(oxy.cylindersAvailable || 0));
+    const conc = Math.max(0, Number(oxy.concentratorsAvailable || 0));
+    const dist = calculateHaversineDistanceKm(originCoords.lat, originCoords.lng, coords.lat, coords.lng);
+    items.push({
+      id: oxy.uid,
+      name: oxy.providerName,
+      resourceKind: 'oxygenProvider',
+      address: oxy.address,
+      city: oxy.city,
+      phone: oxy.contactNumber,
+      coordinates: coords,
+      distanceKm: Number(dist.toFixed(2)),
+      etaMins: Math.max(2, Math.round(dist * 2.5)),
+      withinSearchRadius: dist <= radiusKm,
+      availabilitySummary: `${cyl} cylinders, ${conc} concentrators${oxy.deliveryAvailable ? ' · Delivery available' : ''}`,
+      isAvailable: cyl > 0 || conc > 0,
+      isLiveFirestoreData: true,
+      lastUpdated: formatRelativeLastUpdated(oxy.lastUpdated)
+    });
+  }
+
+  for (const amb of ambulanceProfiles) {
+    const coords = amb.coordinates || inferFallbackCoordinatesForAddress(amb.address, amb.city);
+    if (!coords) continue;
+    const availableVehicles = (amb.vehicles || []).filter((v) => v.isAvailable);
+    const dist = calculateHaversineDistanceKm(originCoords.lat, originCoords.lng, coords.lat, coords.lng);
+    items.push({
+      id: amb.uid,
+      name: amb.providerName,
+      resourceKind: 'ambulanceProvider',
+      address: amb.address,
+      city: amb.city,
+      phone: amb.contactNumber,
+      coordinates: coords,
+      distanceKm: Number(dist.toFixed(2)),
+      etaMins: Math.max(2, Math.round(dist * 2.2)),
+      withinSearchRadius: dist <= radiusKm,
+      availabilitySummary: `${availableVehicles.length} of ${(amb.vehicles || []).length} ambulances ready`,
+      isAvailable: availableVehicles.length > 0,
+      isLiveFirestoreData: true,
+      lastUpdated: formatRelativeLastUpdated(amb.lastUpdated)
+    });
+  }
+
+  const availableSorted = items.filter((i) => i.isAvailable).sort((a, b) => a.distanceKm - b.distanceKm);
+  return {
+    withinRadius: availableSorted.filter((i) => i.withinSearchRadius),
+    outsideRadiusFallback: availableSorted.filter((i) => !i.withinSearchRadius).slice(0, 6)
+  };
 }
 
 /**

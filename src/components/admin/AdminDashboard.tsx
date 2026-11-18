@@ -26,7 +26,8 @@ import {
   Send,
   Edit2,
   XCircle,
-  CheckCircle
+  CheckCircle,
+  Star
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import {
@@ -37,11 +38,13 @@ import {
   subscribeOxygenProfilesFromFirestore,
   subscribeAmbulanceProfilesFromFirestore,
   subscribeProviderUpdateRequests,
+  subscribeAllFeedbackFromFirestore,
   INITIAL_HOSPITAL,
   INITIAL_BLOOD_BANK,
   INITIAL_OXYGEN,
   INITIAL_AMBULANCE
 } from '../../services/dataService';
+import { AdminFeedbackPanel } from './AdminFeedbackPanel';
 import type {
   UserProfile,
   EmergencyCase,
@@ -55,7 +58,8 @@ import type {
   ResourceAssignmentAudit,
   EmergencyLifecycleEvent,
   EmergencyLifecycleStatus,
-  ProviderUpdateRequest
+  ProviderUpdateRequest,
+  CaseFeedback
 } from '../../types';
 import type { EligibleResourceProvider } from '../../services/dataService';
 
@@ -76,7 +80,7 @@ const formatDate = (date: string) => {
 
 export const AdminDashboard: React.FC = () => {
   const { currentUser } = useAuth();
-  const [activeTab, setActiveTab] = useState<'emergencies' | 'providers' | 'users' | 'analytics' | 'coordinator'>('emergencies');
+  const [activeTab, setActiveTab] = useState<'emergencies' | 'providers' | 'users' | 'analytics' | 'coordinator' | 'feedback'>('emergencies');
 
   // Core Data
   const [users, setUsers] = useState<UserProfile[]>([]);
@@ -87,6 +91,9 @@ export const AdminDashboard: React.FC = () => {
   const [oxygenDepots, setOxygenDepots] = useState<OxygenProfile[]>([]);
   const [ambulances, setAmbulances] = useState<AmbulanceProfile[]>([]);
   const [providerUpdates, setProviderUpdates] = useState<ProviderUpdateRequest[]>([]);
+  const [feedbackList, setFeedbackList] = useState<CaseFeedback[]>([]);
+  const [feedbackLoading, setFeedbackLoading] = useState(true);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
   const [coordinatorCases, setCoordinatorCases] = useState<EmergencyCase[]>([]);
   const [coordinatorRequests, setCoordinatorRequests] = useState<ResourceRequest[]>([]);
   const [coordinatorLoading, setCoordinatorLoading] = useState(true);
@@ -150,6 +157,7 @@ export const AdminDashboard: React.FC = () => {
     setOxygenDepots(dataStore.getAllOxygenProfiles());
     setAmbulances(dataStore.getAllAmbulanceProfiles());
     setProviderUpdates(dataStore.getProviderUpdateRequests());
+    setFeedbackList(dataStore.getFeedbackList());
   };
 
   useEffect(() => {
@@ -166,6 +174,7 @@ export const AdminDashboard: React.FC = () => {
       setCoordinatorRequests([]);
       setCoordinatorLoading(false);
       setCoordinatorError('Coordinator data requires an authenticated admin account.');
+      setFeedbackLoading(false);
       return () => {
         unsubscribeLocal();
         unsubHosp();
@@ -175,6 +184,20 @@ export const AdminDashboard: React.FC = () => {
         unsubUpdates();
       };
     }
+
+    setFeedbackLoading(true);
+    setFeedbackError(null);
+    const unsubFeedback = subscribeAllFeedbackFromFirestore(
+      (records) => {
+        setFeedbackList(records);
+        setFeedbackLoading(false);
+        setFeedbackError(null);
+      },
+      (message) => {
+        setFeedbackError(message);
+        setFeedbackLoading(false);
+      }
+    );
 
     let receivedUsers = false;
     let receivedCases = false;
@@ -212,6 +235,7 @@ export const AdminDashboard: React.FC = () => {
       unsubOxy();
       unsubAmb();
       unsubUpdates();
+      unsubFeedback();
     };
   }, [currentUser?.uid, currentUser?.role, coordinatorRefresh]);
 
@@ -969,7 +993,33 @@ export const AdminDashboard: React.FC = () => {
           <Activity className="w-4 h-4" />
           <span>Central Coordinator</span>
         </button>
+
+        <button
+          onClick={() => setActiveTab('feedback')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'feedback'
+              ? 'bg-[#00707E] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Star className="w-4 h-4" />
+          <span>Patient Feedback ({feedbackList.length})</span>
+        </button>
       </div>
+
+      {/* TAB: PATIENT FEEDBACK & SERVICE RATINGS */}
+      {activeTab === 'feedback' && (
+        <AdminFeedbackPanel
+          feedbackList={feedbackList}
+          loading={feedbackLoading}
+          error={feedbackError}
+          hospitals={allHospitals}
+          bloodBanks={allBloodBanks}
+          oxygenDepots={allOxygenDepots}
+          ambulances={allAmbulances}
+          users={users}
+        />
+      )}
 
       {/* TAB 1: LIVE EMERGENCY COORDINATION */}
       {activeTab === 'emergencies' && (

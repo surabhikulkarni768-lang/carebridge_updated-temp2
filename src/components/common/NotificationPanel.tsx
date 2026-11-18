@@ -1,5 +1,5 @@
 import React from 'react';
-import { Bell, CheckCheck, X, Clock, ExternalLink, AlertTriangle, ShieldCheck, Truck, Activity } from 'lucide-react';
+import { Bell, CheckCheck, X, Clock, ExternalLink, AlertTriangle, ShieldCheck, Truck, Activity, Star } from 'lucide-react';
 import type { NotificationItem } from '../../types';
 
 interface NotificationPanelProps {
@@ -38,6 +38,8 @@ export const NotificationPanel: React.FC<NotificationPanelProps> = ({
         return <AlertTriangle className="w-4 h-4 text-red-500" />;
       case 'emergency_status_updated':
         return <Activity className="w-4 h-4 text-teal-600" />;
+      case 'feedback_available':
+        return <Star className="w-4 h-4 text-amber-500 fill-amber-400" />;
       case 'provider_verified':
         return <ShieldCheck className="w-4 h-4 text-teal-500" />;
       default:

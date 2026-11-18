@@ -850,8 +850,76 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    function isCompletedCaseStatus(status) {
+      return status in ['COMPLETED', 'Completed', 'completed', 'resolved', 'RESOLVED'];
+    }
+
+    function validStarRating(value) {
+      return value is int && value >= 1 && value <= 5;
+    }
+
+    function validCaseFeedbackCreate(caseId) {
+      let casePath = /databases/$(database)/documents/cases/$(caseId);
+      let caseData = exists(casePath) ? get(casePath).data : {};
+      let patientUid = caseData.get('patientUid', '');
+      let ambulanceApplicable = request.resource.data.get('ambulanceApplicable', false);
+      return isSignedIn() &&
+        exists(casePath) &&
+        isCompletedCaseStatus(caseData.get('status', '')) &&
+        canSubmitForPatient(patientUid) &&
+        request.resource.data.keys().hasAll([
+          'id',
+          'caseId',
+          'patientUid',
+          'submittedByUid',
+          'overallRating',
+          'hospitalProviderRating',
+          'ambulanceApplicable',
+          'responseTimeSatisfaction',
+          'comments',
+          'createdAt'
+        ]) &&
+        request.resource.data.get('id', '') == caseId &&
+        request.resource.data.get('caseId', '') == caseId &&
+        request.resource.data.get('patientUid', '') == patientUid &&
+        request.resource.data.get('submittedByUid', '') == request.auth.uid &&
+        validStarRating(request.resource.data.get('overallRating', 0)) &&
+        validStarRating(request.resource.data.get('hospitalProviderRating', 0)) &&
+        validStarRating(request.resource.data.get('responseTimeSatisfaction', 0)) &&
+        ambulanceApplicable is bool &&
+        (ambulanceApplicable == true
+          ? validStarRating(request.resource.data.get('ambulanceRating', 0))
+          : request.resource.data.get('ambulanceRating', null) == null) &&
+        request.resource.data.get('comments', '') is string &&
+        request.resource.data.get('comments', '').size() <= 2000 &&
+        request.resource.data.get('createdAt', null) == request.time;
+    }
+
     match /clinicalNotes/{noteId} {
       allow read, write: if isSignedIn();
+    }
+
+    match /feedback/{caseId} {
+      allow get: if isAdmin() ||
+        (isSignedIn() &&
+         (
+           (!exists(/databases/$(database)/documents/feedback/$(caseId)) &&
+            exists(/databases/$(database)/documents/cases/$(caseId)) &&
+            (get(/databases/$(database)/documents/cases/$(caseId)).data.get('patientUid', '') == request.auth.uid ||
+             isAuthorizedAttendantForPatient(get(/databases/$(database)/documents/cases/$(caseId)).data.get('patientUid', '')))) ||
+           (exists(/databases/$(database)/documents/feedback/$(caseId)) &&
+            (resource.data.get('patientUid', '') == request.auth.uid ||
+             resource.data.get('submittedByUid', '') == request.auth.uid ||
+             isAuthorizedAttendantForPatient(resource.data.get('patientUid', ''))))
+         ));
+      allow list: if isAdmin() ||
+        (isSignedIn() &&
+         (resource.data.get('patientUid', '') == request.auth.uid ||
+          resource.data.get('submittedByUid', '') == request.auth.uid ||
+          isAuthorizedAttendantForPatient(resource.data.get('patientUid', ''))));
+      allow create: if validCaseFeedbackCreate(caseId);
+      allow update: if false;
+      allow delete: if isAdmin();
     }
   }
 }

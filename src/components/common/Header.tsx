@@ -35,12 +35,14 @@ interface HeaderProps {
   onNavigateLanding?: () => void;
   onOpenLogin?: () => void;
   onOpenSignup?: () => void;
+  onSelectNotification?: (notif: NotificationItem) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   onNavigateLanding,
   onOpenLogin,
-  onOpenSignup
+  onOpenSignup,
+  onSelectNotification
 }) => {
   const { currentUser, activeRole, logout, isAuthenticated } = useAuth();
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -229,6 +231,10 @@ export const Header: React.FC<HeaderProps> = ({
                   onClose={() => setIsNotifOpen(false)}
                   onMarkRead={(id) => void markRead(id)}
                   onMarkAllRead={() => void markAllRead()}
+                  onSelectNotification={(notif) => {
+                    setIsNotifOpen(false);
+                    if (onSelectNotification) onSelectNotification(notif);
+                  }}
                   error={notificationError}
                 />
               </div>

@@ -20,8 +20,10 @@ import {
   ExternalLink,
   ChevronRight,
   Heart,
-  X
+  X,
+  PlayCircle
 } from 'lucide-react';
+import { HowToUseVideoModal } from './HowToUseVideoModal';
 
 interface LandingPageProps {
   onStartEmergency: () => void;
@@ -36,6 +38,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 }) => {
   const [showPrivacyModal, setShowPrivacyModal] = useState(false);
   const [showTermsModal, setShowTermsModal] = useState(false);
+  const [showHowToUseModal, setShowHowToUseModal] = useState(false);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans selection:bg-teal-100 selection:text-teal-900">
@@ -66,25 +69,41 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
 
           {/* Navigation Links */}
-          <div className="hidden md:flex items-center gap-8 text-xs font-bold text-slate-600">
+          <div className="hidden md:flex items-center gap-7 text-xs font-bold text-slate-600">
             <a href="#home" className="hover:text-teal-600 transition-colors">Home</a>
             <a href="#about" className="hover:text-teal-600 transition-colors">About Us</a>
             <a href="#how-it-works" className="hover:text-teal-600 transition-colors">How It Works</a>
             <a href="#services" className="hover:text-teal-600 transition-colors">Services</a>
-            <a href="#contact" className="hover:text-teal-600 transition-colors">Contact</a>
+            <a href="#contact" className="hover:text-teal-600 transition-colors">Contact Us</a>
+            <button
+              type="button"
+              onClick={() => setShowHowToUseModal(true)}
+              className="inline-flex items-center gap-1.5 text-teal-700 hover:text-teal-800 bg-teal-50 hover:bg-teal-100 border border-teal-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+            >
+              <PlayCircle className="w-3.5 h-3.5" />
+              <span>How to Use</span>
+            </button>
           </div>
 
           {/* Auth Action Buttons */}
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2 sm:gap-2.5">
+            <button
+              type="button"
+              onClick={() => setShowHowToUseModal(true)}
+              className="md:hidden inline-flex items-center gap-1 px-2.5 py-2 text-xs font-bold text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-xl transition-colors cursor-pointer"
+            >
+              <PlayCircle className="w-3.5 h-3.5" />
+              <span>How to Use</span>
+            </button>
             <button
               onClick={onOpenLogin}
-              className="px-4 py-2 text-xs font-bold text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-xl transition-colors"
+              className="px-3 sm:px-4 py-2 text-xs font-bold text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-xl transition-colors"
             >
               Log In
             </button>
             <button
               onClick={onOpenSignup}
-              className="px-4 py-2 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 rounded-xl shadow-xs transition-colors"
+              className="px-3 sm:px-4 py-2 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 rounded-xl shadow-xs transition-colors"
             >
               Sign Up
             </button>
@@ -379,7 +398,10 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 Privacy Policy
               </button>
               <a href="#services" className="hover:text-white transition-colors">Emergency Directory</a>
-              <a href="#contact" className="hover:text-white transition-colors">Support Helpline</a>
+              <a href="#contact" className="hover:text-white transition-colors">Contact Us</a>
+              <button type="button" onClick={() => setShowHowToUseModal(true)} className="hover:text-white transition-colors cursor-pointer">
+                How to Use
+              </button>
             </div>
           </div>
 
@@ -427,6 +449,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
         </div>
       )}
+
+      {/* HOW TO USE GUIDE VIDEO MODAL */}
+      <HowToUseVideoModal
+        isOpen={showHowToUseModal}
+        onClose={() => setShowHowToUseModal(false)}
+      />
 
       {/* PRIVACY POLICY MODAL */}
       {showPrivacyModal && (

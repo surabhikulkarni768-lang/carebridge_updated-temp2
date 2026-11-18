@@ -15,12 +15,20 @@ import { OxygenDashboard } from './components/oxygen/OxygenDashboard';
 import { AmbulanceDashboard } from './components/ambulance/AmbulanceDashboard';
 import { DoctorDashboard } from './components/doctor/DoctorDashboard';
 import { AdminDashboard } from './components/admin/AdminDashboard';
+import { CaseFeedbackModal } from './components/patient/CaseFeedbackModal';
+import { NearbyHospitalsMap } from './components/patient/NearbyHospitalsMap';
 import {
-  searchNearbyHospitals,
-  getGoogleMapEmbedUrl,
+  DEFAULT_SEARCH_RADIUS_KM,
+  assessGpsAccuracy,
+  formatAccuracyMeters,
+  formatDistanceKm,
+  mergeHospitalsWithFirestoreData,
+  findNearbyHospitalsByCoordinates,
+  findNearbyFirestoreResourcesByCoordinates,
+  resolveManualAddressToCoordinates,
   getGoogleMapsDirectionsUrl,
   buildProvidersLookup,
-  POPULAR_LOCATIONS,
+  type GpsLocationReading,
   type HospitalProvider
 } from './services/hospitalDirectoryService';
 import {
@@ -35,7 +43,15 @@ import {
   validateEmergencyCasePayload,
   fetchRequestsForCasesFromFirestore,
   subscribePatientLinksFromFirestore,
-  subscribeCasesForAttendantFromFirestore
+  subscribeCasesForAttendantFromFirestore,
+  subscribeFeedbackForPatientFromFirestore,
+  subscribeNotificationsForUserFromFirestore,
+  subscribeHospitalProfilesFromFirestore,
+  subscribeBloodBankProfilesFromFirestore,
+  subscribeOxygenProfilesFromFirestore,
+  subscribeAmbulanceProfilesFromFirestore,
+  markNotificationReadInFirestore,
+  isCaseCompletedStatus
 } from './services/dataService';
 import type {
   PatientLink,
@@ -45,7 +61,13 @@ import type {
   EmergencyCase as EmergencyCaseRecord,
   EmergencyCase as DomainEmergencyCase,
   CaseStatus,
-  EmergencyServiceStatus
+  EmergencyServiceStatus,
+  CaseFeedback,
+  NotificationItem,
+  HospitalProfile,
+  BloodBankProfile,
+  OxygenProfile,
+  AmbulanceProfile
 } from './types';
 import {
   Heart,
@@ -84,7 +106,14 @@ import {
   Stethoscope,
   Droplet,
   Wind,
-  Navigation
+  Navigation,
+  Star,
+  MessageSquare,
+  Database,
+  Bed,
+  HeartPulse,
+  Truck,
+  Crosshair
 } from 'lucide-react';
 
 // ==========================================
@@ -368,10 +397,15 @@ export interface EmergencyCase {
   resourcesList: string[];
   individualStatuses: ResourceStatusItem[];
   rejectionReason?: string;
+  assignedHospitalUid?: string;
   assignedHospitalName?: string;
+  assignedAmbulanceUid?: string;
   assignedAmbulanceName?: string;
+  assignedBloodBankUid?: string;
   assignedBloodBankName?: string;
+  assignedOxygenUid?: string;
   assignedOxygenName?: string;
+  updatedAt?: string;
   serviceStatuses?: Record<string, any>;
   quotas?: any;
 }
@@ -550,6 +584,36 @@ function CareBridgeApp() {
   const [savingAttendantUid, setSavingAttendantUid] = useState<string | null>(null);
   const [historyNotice, setHistoryNotice] = useState<string | null>(null);
   const [selectedCaseFromHistory, setSelectedCaseFromHistory] = useState(false);
+
+  // Completed-Case Patient Feedback & Live Notification State
+  const [submittedFeedbackList, setSubmittedFeedbackList] = useState<CaseFeedback[]>([]);
+  const [feedbackModalCase, setFeedbackModalCase] = useState<EmergencyCase | null>(null);
+  const [dismissedFeedbackNoticeIds, setDismissedFeedbackNoticeIds] = useState<string[]>([]);
+  const [dashboardNotifications, setDashboardNotifications] = useState<NotificationItem[]>([]);
+
+  const feedbackByCaseId = useMemo(() => {
+    const map: Record<string, CaseFeedback> = {};
+    submittedFeedbackList.forEach((item) => {
+      map[item.caseId] = item;
+    });
+    return map;
+  }, [submittedFeedbackList]);
+
+  const completedCasesPendingFeedback = useMemo(
+    () =>
+      casesList.filter(
+        (c) => isCaseCompletedStatus(c.status) && !feedbackByCaseId[c.caseId]
+      ),
+    [casesList, feedbackByCaseId]
+  );
+
+  const visibleFeedbackNotices = useMemo(
+    () =>
+      completedCasesPendingFeedback.filter(
+        (c) => !dismissedFeedbackNoticeIds.includes(c.caseId)
+      ),
+    [completedCasesPendingFeedback, dismissedFeedbackNoticeIds]
+  );
 
   // Additional Resource Request State (for active emergency cases)
   const [isAdditionalResourceModalOpen, setIsAdditionalResourceModalOpen] = useState(false);
@@ -849,6 +913,39 @@ function CareBridgeApp() {
     };
   }, [currentUser]);
 
+  // Subscribe to submitted feedback records for this patient / attendant and linked patients
+  useEffect(() => {
+    if (!currentUser) {
+      setSubmittedFeedbackList([]);
+      setFeedbackModalCase(null);
+      setDismissedFeedbackNoticeIds([]);
+      setDashboardNotifications([]);
+      return;
+    }
+
+    const linkedPatientUids = linkedPatients.map((l) => l.patientUid).filter(Boolean);
+    const unsubFeedback = subscribeFeedbackForPatientFromFirestore(
+      currentUser.uid,
+      linkedPatientUids,
+      (records) => {
+        setSubmittedFeedbackList(records);
+      }
+    );
+
+    const unsubNotifications = subscribeNotificationsForUserFromFirestore(
+      currentUser.uid,
+      (items) => {
+        setDashboardNotifications(items);
+      },
+      () => {}
+    );
+
+    return () => {
+      unsubFeedback();
+      unsubNotifications();
+    };
+  }, [currentUser?.uid, linkedPatients]);
+
   // Synchronize open dashboard case modal with live casesList updates
   useEffect(() => {
     if (!selectedDashboardCase) return;
@@ -905,59 +1002,178 @@ function CareBridgeApp() {
     };
   }, [dashboardTab, currentUser?.uid, currentUser?.role]);
 
-  // Dynamic Nearby Hospitals & Provider Directory Lookup
+  // Real-time Firestore Provider Availability & Coordinate-Based Nearby Hospital Discovery
   const [showMap, setShowMap] = useState<boolean>(true);
   const [locationNotice, setLocationNotice] = useState<string | null>(null);
+  const [firestoreHospitals, setFirestoreHospitals] = useState<HospitalProfile[]>([]);
+  const [firestoreBloodBanks, setFirestoreBloodBanks] = useState<BloodBankProfile[]>([]);
+  const [firestoreOxygenProfiles, setFirestoreOxygenProfiles] = useState<OxygenProfile[]>([]);
+  const [firestoreAmbulanceProfiles, setFirestoreAmbulanceProfiles] = useState<AmbulanceProfile[]>([]);
+  const [patientGpsReading, setPatientGpsReading] = useState<GpsLocationReading | null>(null);
+  const [gpsPermissionState, setGpsPermissionState] = useState<'idle' | 'requesting' | 'granted' | 'denied' | 'unavailable' | 'timeout'>('idle');
+  const [manualAddressInput, setManualAddressInput] = useState<string>('');
+  const [isGeocodingManual, setIsGeocodingManual] = useState<boolean>(false);
+  const [manualAddressError, setManualAddressError] = useState<string | null>(null);
+  const manualAddressInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Subscribe to real-time Firestore availability for hospitals and emergency resources
+  useEffect(() => {
+    const unsubHosp = subscribeHospitalProfilesFromFirestore(setFirestoreHospitals);
+    const unsubBlood = subscribeBloodBankProfilesFromFirestore(setFirestoreBloodBanks);
+    const unsubOxy = subscribeOxygenProfilesFromFirestore(setFirestoreOxygenProfiles);
+    const unsubAmb = subscribeAmbulanceProfilesFromFirestore(setFirestoreAmbulanceProfiles);
+    return () => {
+      unsubHosp();
+      unsubBlood();
+      unsubOxy();
+      unsubAmb();
+    };
+  }, []);
+
+  const allMergedHospitals = useMemo(
+    () => mergeHospitalsWithFirestoreData(firestoreHospitals),
+    [firestoreHospitals]
+  );
+
+  const gpsAccuracyAssessment = useMemo(
+    () =>
+      patientGpsReading
+        ? assessGpsAccuracy(patientGpsReading.accuracyMeters, patientGpsReading.source)
+        : null,
+    [patientGpsReading]
+  );
+
+  const coordinateSearchResult = useMemo(() => {
+    if (!patientGpsReading) return null;
+    return findNearbyHospitalsByCoordinates(
+      { lat: patientGpsReading.lat, lng: patientGpsReading.lng },
+      allMergedHospitals,
+      selectedResources,
+      DEFAULT_SEARCH_RADIUS_KM
+    );
+  }, [patientGpsReading, allMergedHospitals, selectedResources]);
+
+  const nearbyFirestoreResources = useMemo(() => {
+    if (!patientGpsReading) {
+      return { withinRadius: [], outsideRadiusFallback: [] };
+    }
+    return findNearbyFirestoreResourcesByCoordinates(
+      { lat: patientGpsReading.lat, lng: patientGpsReading.lng },
+      firestoreBloodBanks,
+      firestoreOxygenProfiles,
+      firestoreAmbulanceProfiles,
+      DEFAULT_SEARCH_RADIUS_KM
+    );
+  }, [patientGpsReading, firestoreBloodBanks, firestoreOxygenProfiles, firestoreAmbulanceProfiles]);
 
   const nearbyHospitals = useMemo(() => {
-    return searchNearbyHospitals(searchLocation, selectedResources);
-  }, [searchLocation, selectedResources]);
+    return coordinateSearchResult ? coordinateSearchResult.displayedHospitals : [];
+  }, [coordinateSearchResult]);
 
   const PROVIDERS = useMemo(() => {
-    return buildProvidersLookup(nearbyHospitals);
-  }, [nearbyHospitals]);
+    return buildProvidersLookup(nearbyHospitals.length > 0 ? nearbyHospitals : allMergedHospitals);
+  }, [nearbyHospitals, allMergedHospitals]);
 
   const selectedHospital = useMemo(() => {
-    return nearbyHospitals.find((h) => h.id === selectedProviderId) || nearbyHospitals[0] || null;
-  }, [nearbyHospitals, selectedProviderId]);
+    return (
+      nearbyHospitals.find((h) => h.id === selectedProviderId) ||
+      allMergedHospitals.find((h) => h.id === selectedProviderId) ||
+      nearbyHospitals[0] ||
+      null
+    );
+  }, [nearbyHospitals, allMergedHospitals, selectedProviderId]);
 
   useEffect(() => {
     if (nearbyHospitals.length > 0) {
       const exists = nearbyHospitals.some((h) => h.id === selectedProviderId);
-      if (!exists && !PROVIDERS[selectedProviderId]) {
+      if (!exists) {
         setSelectedProviderId(nearbyHospitals[0].id);
       }
     }
-  }, [nearbyHospitals, selectedProviderId, PROVIDERS]);
+  }, [nearbyHospitals, selectedProviderId]);
 
   const handleDetectLocation = () => {
     if (!navigator.geolocation) {
-      setLocationNotice('Geolocation is not supported by your browser.');
-      setTimeout(() => setLocationNotice(null), 4000);
+      setGpsPermissionState('unavailable');
+      setLocationNotice('Geolocation is not supported by your browser. Please enter your street address or coordinates manually below.');
       return;
     }
     setIsLocating(true);
-    setLocationNotice('Detecting your GPS location...');
+    setGpsPermissionState('requesting');
+    setManualAddressError(null);
+    setLocationNotice('Requesting permission for your device GPS location...');
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         setIsLocating(false);
-        const { latitude, longitude } = pos.coords;
-        const locString = `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+        const { latitude, longitude, accuracy } = pos.coords;
+        const reading: GpsLocationReading = {
+          lat: latitude,
+          lng: longitude,
+          accuracyMeters: Number.isFinite(accuracy) ? accuracy : null,
+          source: 'gps',
+          capturedAt: new Date().toISOString()
+        };
+        setPatientGpsReading(reading);
+        setGpsPermissionState('granted');
+        const locString = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
         handleUpdateLocation(locString);
-        setLocationNotice(`Location detected: ${locString}`);
-        setTimeout(() => setLocationNotice(null), 4000);
+        setIncidentAddress(`GPS (${locString})`);
+        setLocationPermissionStatus('granted');
+        const assessment = assessGpsAccuracy(reading.accuracyMeters, 'gps');
+        setLocationNotice(
+          `GPS captured: ${locString} (${assessment.label}).`
+        );
       },
       (err) => {
         setIsLocating(false);
-        let msg = 'Unable to retrieve location.';
-        if (err.code === 1) msg = 'Location permission denied. Please choose a city below.';
-        else if (err.code === 2) msg = 'Location unavailable. Please choose a city below.';
-        else if (err.code === 3) msg = 'Location request timed out.';
-        setLocationNotice(msg);
-        setTimeout(() => setLocationNotice(null), 4000);
+        if (err.code === 1) {
+          setGpsPermissionState('denied');
+          setLocationNotice('GPS permission denied. You can allow location in browser settings or enter your exact street address / coordinates below.');
+        } else if (err.code === 2) {
+          setGpsPermissionState('unavailable');
+          setLocationNotice('GPS position is currently unavailable. Please retry or enter your street address / coordinates manually.');
+        } else {
+          setGpsPermissionState('timeout');
+          setLocationNotice('GPS request timed out. Retry for a better fix or enter your street address / coordinates manually.');
+        }
       },
-      { timeout: 10000, enableHighAccuracy: true }
+      { timeout: 12000, enableHighAccuracy: true, maximumAge: 0 }
     );
+  };
+
+  const handleManualAddressSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const raw = manualAddressInput.trim();
+    if (!raw) {
+      setManualAddressError('Please enter a street address, landmark, or latitude, longitude (e.g. 15.3524, 75.1328).');
+      return;
+    }
+    setIsGeocodingManual(true);
+    setManualAddressError(null);
+    try {
+      const resolved = await resolveManualAddressToCoordinates(raw);
+      if (!resolved) {
+        setManualAddressError(
+          'Could not resolve coordinates for that address. Try including the city/area or enter exact coordinates as "latitude, longitude" (e.g. 15.3524, 75.1328).'
+        );
+        return;
+      }
+      const reading: GpsLocationReading = {
+        lat: resolved.lat,
+        lng: resolved.lng,
+        accuracyMeters: null,
+        source: resolved.source,
+        label: resolved.resolvedLabel,
+        capturedAt: new Date().toISOString()
+      };
+      setPatientGpsReading(reading);
+      const coordLabel = `${resolved.lat.toFixed(5)}, ${resolved.lng.toFixed(5)}`;
+      handleUpdateLocation(resolved.resolvedLabel || coordLabel);
+      setIncidentAddress(resolved.resolvedLabel || raw);
+      setLocationNotice(`Location coordinates set to ${coordLabel} (${resolved.resolvedLabel}).`);
+    } finally {
+      setIsGeocodingManual(false);
+    }
   };
 
   const getAttendantConsentFingerprint = () => JSON.stringify({
@@ -1335,8 +1551,15 @@ function CareBridgeApp() {
         location: {
           city: requestCity,
           address: incidentAddress.trim(),
-          state: currentUser.state || 'Karnataka'
+          state: currentUser.state || 'Karnataka',
+          ...(patientGpsReading
+            ? { coordinates: { lat: patientGpsReading.lat, lng: patientGpsReading.lng } }
+            : {})
         },
+        ...(patientGpsReading
+          ? { incidentCoordinates: { lat: patientGpsReading.lat, lng: patientGpsReading.lng } }
+          : {}),
+        ...(selectedHospital?.name ? { matchedHospitalName: selectedHospital.name } : {}),
         attendant: {
           ...(isAttendantRole ? { uid: requesterUid } : {}),
           name: finalAttendantName,
@@ -1682,11 +1905,13 @@ function CareBridgeApp() {
 
   const openHistoryDetails = (record: EmergencyCaseRecord) => {
     const createdAt = new Date(record.createdAt);
-    const status = record.status === 'resolved'
+    const status = isCaseCompletedStatus(record.status)
       ? 'Completed'
-      : record.status === 'cancelled'
+      : String(record.status || '').toUpperCase() === 'CANCELLED'
         ? 'Cancelled'
-        : 'Active';
+        : String(record.status || '').toUpperCase() === 'REJECTED'
+          ? 'Rejected'
+          : record.status || 'Active';
     const resourceNames: Record<string, string> = {
       bed: 'Hospital Bed',
       icu: 'ICU',
@@ -1696,24 +1921,27 @@ function CareBridgeApp() {
       doctor: 'Doctor'
     };
     setSelectedDashboardCase({
+      ...record,
       caseId: record.caseId,
+      patientUid: record.patientUid || record.patientId || currentUser?.uid,
       status,
       createdAt: createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       dateStr: createdAt.toLocaleDateString(),
       patientName: record.patientName,
       patientAge: String(record.patientAge),
       patientGender: record.patientGender,
-      patientBloodGroup: 'Not provided',
+      patientBloodGroup: record.patientBloodGroup || 'Not provided',
       patientCondition: record.conditionSummary || record.patientCondition || 'Emergency Medical Request',
       attendantName: record.attendant?.name || 'Not provided',
       attendantRelation: record.attendant?.relation || 'Not provided',
       attendantPhone: record.attendant?.phone || 'Not provided',
       incidentAddress: record.location?.address || 'Not provided',
-      triagePriority: record.urgencyLevel || 'urgent',
+      triagePriority: normalizeTriagePriority(record.urgencyLevel),
       emergencyDescription: record.conditionSummary || record.patientCondition || 'Emergency Medical Request',
-      providerName: record.matchedHospitalName || 'Not assigned',
+      providerName: record.assignedHospitalName || record.matchedHospitalName || 'Not assigned',
       providerDetails: 'Emergency case record',
       providerRating: 'Verified provider',
+      resourcesNeeded: record.resourcesNeeded || [],
       resourcesList: (record.resourcesNeeded || []).map((resource) => resourceNames[resource] || resource),
       individualStatuses: (record.resourceRequests || []).map((request) => ({
         resource: request.resourceType,
@@ -1727,6 +1955,65 @@ function CareBridgeApp() {
     setSelectedCaseFromHistory(true);
   };
 
+  const openFeedbackForHistoryRecord = (record: EmergencyCaseRecord) => {
+    const existing = casesList.find((c) => c.caseId === record.caseId);
+    if (existing) {
+      setFeedbackModalCase(existing);
+      return;
+    }
+    const createdAt = new Date(record.createdAt);
+    setFeedbackModalCase({
+      ...record,
+      caseId: record.caseId,
+      patientUid: record.patientUid || record.patientId || currentUser?.uid,
+      status: record.status,
+      createdAt: createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      dateStr: createdAt.toLocaleDateString(),
+      patientName: record.patientName,
+      patientAge: String(record.patientAge || ''),
+      patientGender: record.patientGender || 'Unknown',
+      patientBloodGroup: record.patientBloodGroup || 'Unknown',
+      patientCondition: record.conditionSummary || record.patientCondition || 'Emergency Medical Request',
+      attendantName: record.attendant?.name || currentUser?.displayName || 'Patient',
+      attendantRelation: record.attendant?.relation || 'Self',
+      attendantPhone: record.attendant?.phone || currentUser?.phone || '',
+      incidentAddress: record.location?.address || 'Not provided',
+      triagePriority: normalizeTriagePriority(record.urgencyLevel),
+      emergencyDescription: record.conditionSummary || record.patientCondition || 'Emergency Medical Request',
+      providerName: record.assignedHospitalName || record.matchedHospitalName || 'CareBridge Emergency Network',
+      providerDetails: 'Emergency case record',
+      providerRating: 'Verified provider',
+      resourcesNeeded: record.resourcesNeeded || [],
+      resourcesList: record.resourcesList || [],
+      individualStatuses: record.individualStatuses || []
+    });
+  };
+
+  const handleSelectHeaderNotification = (notif: NotificationItem) => {
+    const targetCaseId = notif.relatedCaseId || notif.emergencyId;
+    if (!targetCaseId) return;
+    const isPatientOrAttendant =
+      !activeRole ||
+      activeRole === 'patient' ||
+      activeRole === 'patientAttendant' ||
+      activeRole === 'patient_attendant' ||
+      activeRole === 'attendant';
+    if (!isPatientOrAttendant) return;
+
+    setCurrentScreen('dashboard');
+    const matchedCase = casesList.find((c) => c.caseId === targetCaseId);
+    if (
+      matchedCase &&
+      (notif.type === 'feedback_available' ||
+        isCaseCompletedStatus(notif.newStatus) ||
+        isCaseCompletedStatus(matchedCase.status))
+    ) {
+      setFeedbackModalCase(matchedCase);
+    } else if (matchedCase) {
+      setSelectedDashboardCase(matchedCase);
+    }
+  };
+
   return (
     <div className="min-h-screen w-screen bg-[#F0F4F8] text-slate-900 font-sans flex flex-col justify-between selection:bg-teal-100 selection:text-teal-900">
       {/* Global CareBridge Official Header & Notification Telemetry */}
@@ -1734,6 +2021,7 @@ function CareBridgeApp() {
         onNavigateLanding={() => setCurrentScreen('landing')}
         onOpenLogin={() => setCurrentScreen('login')}
         onOpenSignup={() => setCurrentScreen('signup')}
+        onSelectNotification={handleSelectHeaderNotification}
       />
 
       {/* Administrative Inspection Bar (Visible Only When Authenticated As Coordinator/Admin) */}
@@ -1957,231 +2245,433 @@ function CareBridgeApp() {
                 </div>
               </div>
 
-              {/* PANEL 2: "2. Enter Location & Provider Status" (Right Soft-Blue Card with Multi-Hospital Search & Live Google Map) */}
+              {/* PANEL 2: "2. Patient GPS Location & Nearby Available Hospitals (2 km Radius)" */}
               <div className="bg-[#EEF3F8] rounded-3xl shadow-xl p-5 sm:p-7 border border-slate-200/60 flex flex-col justify-between">
                 <div>
-                  <div className="flex items-center justify-between gap-2 mb-3">
-                    <h2 className="text-xl sm:text-2xl font-bold text-[#0F3868] tracking-tight">
-                      2. Enter Location & Provider Status
-                    </h2>
-                    <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-teal-100 text-[#00707E] shrink-0">
-                      {nearbyHospitals.length} Facilities Nearby
-                    </span>
-                  </div>
-
-                  {/* Location Search Bar + GPS Location Detector */}
-                  <div className="flex items-center gap-2 mb-2">
-                    <div className="relative flex-1">
-                      <MapPin className="absolute left-3.5 top-2.5 h-4 w-4 text-slate-500" />
-                      <input
-                        type="text"
-                        value={searchLocation}
-                        onChange={(e) => handleUpdateLocation(e.target.value)}
-                        placeholder="Search city, area, or landmark (e.g. Dharwad, Belagavi)..."
-                        className="w-full pl-10 pr-3 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#00707E] font-medium text-slate-900 shadow-2xs"
-                      />
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                    <div>
+                      <h2 className="text-xl sm:text-2xl font-bold text-[#0F3868] tracking-tight">
+                        2. Nearby Hospitals &amp; Live Availability
+                      </h2>
+                      <p className="text-[11px] text-slate-600 mt-0.5">
+                        Coordinate-based search within a <strong>{DEFAULT_SEARCH_RADIUS_KM} km radius</strong> with live Firestore bed &amp; ICU updates.
+                      </p>
                     </div>
-                    <button
-                      onClick={() => {}}
-                      className="px-4 py-2 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white text-sm font-semibold transition-colors shadow-xs shrink-0 flex items-center gap-1.5"
-                    >
-                      <Search className="h-3.5 w-3.5" />
-                      <span>Search</span>
-                    </button>
-                    <button
-                      onClick={handleDetectLocation}
-                      disabled={isLocating}
-                      title="Auto-detect hospitals near your current GPS location"
-                      className="px-3 py-2 rounded-xl bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 text-sm font-medium transition-colors shadow-2xs shrink-0 flex items-center gap-1.5"
-                    >
-                      <Navigation className={`h-4 w-4 text-[#00707E] ${isLocating ? 'animate-spin' : ''}`} />
-                      <span className="hidden sm:inline">{isLocating ? 'Locating...' : 'GPS'}</span>
-                    </button>
+                    {coordinateSearchResult && (
+                      <span
+                        className={`text-xs font-bold px-2.5 py-1 rounded-full shrink-0 border ${
+                          coordinateSearchResult.usedOutsideRadiusFallback
+                            ? 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                            : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                        }`}
+                      >
+                        {coordinateSearchResult.usedOutsideRadiusFallback
+                          ? `${coordinateSearchResult.displayedHospitals.length} Closest Outside ${DEFAULT_SEARCH_RADIUS_KM} km`
+                          : `${coordinateSearchResult.eligibleWithinRadius.length} Eligible Within ${DEFAULT_SEARCH_RADIUS_KM} km`}
+                      </span>
+                    )}
                   </div>
 
-                  {/* Geolocation status / error alert */}
-                  {locationNotice && (
-                    <div className="mb-2 text-xs font-medium text-teal-900 bg-teal-50 border border-teal-200 px-3 py-1.5 rounded-lg flex items-center gap-2 shadow-2xs">
-                      <MapPin className="h-3.5 w-3.5 text-[#00707E] shrink-0" />
-                      <span>{locationNotice}</span>
-                    </div>
-                  )}
-
-                  {/* Quick City Selection Chips */}
-                  <div className="flex items-center gap-1.5 overflow-x-auto pb-2 mb-3 scrollbar-thin">
-                    <span className="text-[11px] font-bold text-slate-500 whitespace-nowrap">Popular:</span>
-                    {POPULAR_LOCATIONS.map((loc) => {
-                      const isActive = searchLocation.toLowerCase().includes(loc.label.toLowerCase());
-                      return (
-                        <button
-                          key={loc.label}
-                          type="button"
-                          onClick={() => handleUpdateLocation(loc.query)}
-                          className={`text-xs px-2.5 py-1 rounded-full font-medium whitespace-nowrap transition-all ${
-                            isActive
-                              ? 'bg-[#00707E] text-white shadow-2xs ring-1 ring-[#00707E]'
-                              : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200'
-                          }`}
-                        >
-                          📍 {loc.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {/* Interactive Embedded Google Map */}
-                  <div className="mb-3.5 bg-white rounded-2xl border border-slate-200/80 overflow-hidden shadow-xs">
-                    <div className="px-3.5 py-2 bg-slate-50 border-b border-slate-200/70 flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <MapPin className="h-4 w-4 text-[#00707E] shrink-0" />
-                        <span className="text-xs font-bold text-slate-800 truncate">
-                          Map: {selectedHospital ? selectedHospital.name : searchLocation}
+                  {/* Primary GPS Permission Request + Manual Address / Coordinates Entry */}
+                  <div className="bg-white rounded-2xl p-3.5 border border-slate-200/90 shadow-2xs space-y-2.5 mb-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDetectLocation}
+                        disabled={isLocating}
+                        className="flex-1 sm:flex-none inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-[#00707E] hover:bg-[#005B66] disabled:opacity-60 text-white text-xs sm:text-sm font-bold shadow-xs transition-colors cursor-pointer"
+                      >
+                        <Crosshair className={`h-4 w-4 ${isLocating ? 'animate-spin' : ''}`} />
+                        <span>
+                          {isLocating
+                            ? 'Requesting GPS Location...'
+                            : patientGpsReading?.source === 'gps'
+                              ? 'Refresh My GPS Location'
+                              : 'Use My Current GPS Location'}
                         </span>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {selectedHospital && (
-                          <a
-                            href={getGoogleMapsDirectionsUrl(selectedHospital, searchLocation)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-[11px] font-semibold text-[#00707E] hover:underline flex items-center gap-1"
-                          >
-                            <span>Directions</span>
-                            <ExternalLink className="h-3 w-3" />
-                          </a>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => setShowMap(!showMap)}
-                          className="text-[11px] font-medium text-slate-600 hover:text-slate-900 px-2 py-0.5 rounded bg-white border border-slate-200 transition-colors"
-                        >
-                          {showMap ? 'Hide Map' : 'Show Map'}
-                        </button>
-                      </div>
+                      </button>
+
+                      {firestoreHospitals.length > 0 && (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
+                          <Database className="h-3 w-3 text-emerald-600" />
+                          <span>Firestore Live Sync Active</span>
+                        </span>
+                      )}
                     </div>
-                    {showMap && (
-                      <div className="relative w-full h-44 sm:h-48 bg-slate-100">
-                        <iframe
-                          title="Nearby Hospitals Google Map"
-                          width="100%"
-                          height="100%"
-                          loading="lazy"
-                          className="border-0 w-full h-full"
-                          src={getGoogleMapEmbedUrl(searchLocation, selectedHospital)}
-                          allowFullScreen
+
+                    {/* Manual Street Address or Coordinates Input */}
+                    <form onSubmit={handleManualAddressSubmit} className="flex items-center gap-2">
+                      <div className="relative flex-1">
+                        <MapPin className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                        <input
+                          ref={manualAddressInputRef}
+                          type="text"
+                          value={manualAddressInput}
+                          onChange={(e) => {
+                            setManualAddressInput(e.target.value);
+                            if (manualAddressError) setManualAddressError(null);
+                          }}
+                          placeholder="Or enter street address / lat, lng (e.g. 15.3524, 75.1328)..."
+                          aria-label="Enter manual street address or latitude and longitude"
+                          className="w-full pl-9 pr-3 py-2 text-xs sm:text-sm bg-slate-50 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#00707E] font-medium text-slate-900"
                         />
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={isGeocodingManual}
+                        className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white text-xs font-bold transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Search className="h-3.5 w-3.5" />
+                        <span>{isGeocodingManual ? 'Locating...' : 'Locate'}</span>
+                      </button>
+                    </form>
+
+                    {manualAddressError && (
+                      <div role="alert" className="text-xs text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-xl flex items-start gap-2">
+                        <AlertCircle className="h-4 w-4 text-red-600 shrink-0 mt-0.5" />
+                        <span>{manualAddressError}</span>
+                      </div>
+                    )}
+
+                    {/* Permission / Status Notice */}
+                    {locationNotice && !patientGpsReading && (
+                      <div
+                        role="status"
+                        className={`text-xs font-medium px-3 py-2 rounded-xl flex items-start gap-2 border ${
+                          gpsPermissionState === 'denied' || gpsPermissionState === 'unavailable' || gpsPermissionState === 'timeout'
+                            ? 'bg-amber-50 text-amber-900 border-amber-200'
+                            : 'bg-teal-50 text-teal-900 border-teal-200'
+                        }`}
+                      >
+                        <MapPin className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                        <span>{locationNotice}</span>
                       </div>
                     )}
                   </div>
 
-                  {/* Multiple Nearby Hospitals List */}
-                  <div className="space-y-2.5 max-h-[360px] overflow-y-auto pr-1 mb-4 scrollbar-thin">
-                    {nearbyHospitals.map((hospital) => {
-                      const isSelected = selectedProviderId === hospital.id;
-                      return (
-                        <div
-                          key={hospital.id}
-                          className={`p-3.5 rounded-2xl bg-white border transition-all ${
-                            isSelected
-                              ? 'border-[#00707E] ring-2 ring-[#00707E]/30 shadow-sm bg-teal-50/20'
-                              : 'border-slate-200/80 hover:border-slate-300 shadow-2xs'
+                  {/* Separate GPS Accuracy vs 2 km Search Radius Telemetry Card */}
+                  {patientGpsReading && gpsAccuracyAssessment && (
+                    <div
+                      role={gpsAccuracyAssessment.tier === 'poor' ? 'alert' : 'status'}
+                      className={`mb-3 rounded-2xl p-3.5 border text-xs space-y-2 shadow-2xs ${
+                        gpsAccuracyAssessment.tier === 'good'
+                          ? 'bg-emerald-50/80 border-emerald-300 text-emerald-950'
+                          : gpsAccuracyAssessment.tier === 'caution'
+                            ? 'bg-amber-50/90 border-amber-300 text-amber-950'
+                            : gpsAccuracyAssessment.tier === 'poor'
+                              ? 'bg-red-50 border-red-300 text-red-950'
+                              : 'bg-sky-50/80 border-sky-200 text-slate-900'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono font-bold bg-white/90 border border-slate-200 px-2 py-0.5 rounded-md text-[#0F3868]">
+                            Lat: {patientGpsReading.lat.toFixed(5)}, Lng: {patientGpsReading.lng.toFixed(5)}
+                          </span>
+                          <span className="font-bold bg-white/90 border border-teal-200 text-[#00707E] px-2 py-0.5 rounded-md">
+                            Search Radius: {DEFAULT_SEARCH_RADIUS_KM} km
+                          </span>
+                        </div>
+                        <span
+                          className={`font-extrabold px-2.5 py-0.5 rounded-full text-[11px] border ${
+                            gpsAccuracyAssessment.tier === 'good'
+                              ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                              : gpsAccuracyAssessment.tier === 'caution'
+                                ? 'bg-amber-100 text-amber-900 border-amber-300'
+                                : gpsAccuracyAssessment.tier === 'poor'
+                                  ? 'bg-red-100 text-red-900 border-red-300'
+                                  : 'bg-white text-slate-700 border-slate-300'
                           }`}
                         >
-                          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-1.5 flex-wrap mb-1">
-                                <h3 className="font-bold text-slate-900 text-sm sm:text-base leading-snug">
-                                  {hospital.name}
-                                </h3>
-                                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200">
-                                  {hospital.type}
-                                </span>
-                                {hospital.isEmergency24x7 && (
-                                  <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
-                                    24/7 ER
-                                  </span>
-                                )}
-                              </div>
+                          {gpsAccuracyAssessment.label}
+                        </span>
+                      </div>
 
-                              <p className="text-xs text-slate-500 flex items-center gap-1 mb-1">
-                                <MapPin className="h-3 w-3 text-slate-400 shrink-0" />
-                                <span className="truncate">{hospital.address}</span>
-                              </p>
+                      <p className="text-[11px] leading-relaxed">
+                        {gpsAccuracyAssessment.message}
+                      </p>
 
-                              <p className="text-xs font-semibold text-[#00707E] mb-2">
-                                📍 {hospital.distanceKm} km away • Est. Arrival: ~{hospital.etaMins} mins
-                              </p>
+                      {gpsAccuracyAssessment.recommendManualOrRetry && (
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={handleDetectLocation}
+                            disabled={isLocating}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-bold cursor-pointer"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>Retry Better GPS Fix</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => manualAddressInputRef.current?.focus()}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white hover:bg-slate-50 border border-red-300 text-red-800 text-[11px] font-bold cursor-pointer"
+                          >
+                            <MapPin className="h-3 w-3" />
+                            <span>Enter Manual Address</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
-                              {/* Available Resources summary pill row */}
-                              <div className="flex flex-wrap gap-1.5 mb-2">
-                                {hospital.availableResources.beds > 0 && (
-                                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-teal-50 text-teal-900 border border-teal-200">
-                                    🛏️ {hospital.availableResources.beds} Beds
-                                  </span>
-                                )}
-                                {hospital.availableResources.icu > 0 && (
-                                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-900 border border-indigo-200">
-                                    🫀 {hospital.availableResources.icu} ICU
-                                  </span>
-                                )}
-                                {hospital.availableResources.bloodUnits > 0 && (
-                                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-rose-50 text-rose-900 border border-rose-200">
-                                    🩸 {hospital.availableResources.bloodUnits} Blood Units
-                                  </span>
-                                )}
-                                {hospital.availableResources.oxygenTanks > 0 && (
-                                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-cyan-50 text-cyan-900 border border-cyan-200">
-                                    💨 {hospital.availableResources.oxygenTanks} Oxygen
-                                  </span>
-                                )}
-                                {hospital.availableResources.ambulances > 0 && (
-                                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-50 text-amber-900 border border-amber-200">
-                                    🚑 {hospital.availableResources.ambulances} Ambulances
-                                  </span>
-                                )}
-                              </div>
+                  {/* Interactive Map Header & Toggle */}
+                  <div className="mb-3">
+                    <div className="flex items-center justify-between mb-1.5 px-1">
+                      <span className="text-xs font-bold text-[#0F3868] flex items-center gap-1.5">
+                        <MapPin className="h-3.5 w-3.5 text-[#00707E]" />
+                        <span>
+                          {patientGpsReading
+                            ? 'Interactive Map — Your Location & Nearby Hospitals'
+                            : 'Interactive Map (Enable GPS or Locate Address to Pin Your Position)'}
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setShowMap(!showMap)}
+                        className="text-[11px] font-semibold text-slate-600 hover:text-slate-900 px-2 py-0.5 rounded bg-white border border-slate-200 cursor-pointer"
+                      >
+                        {showMap ? 'Hide Map' : 'Show Map'}
+                      </button>
+                    </div>
+                    {showMap && (
+                      <NearbyHospitalsMap
+                        patientLocation={patientGpsReading}
+                        accuracyAssessment={gpsAccuracyAssessment}
+                        hospitals={nearbyHospitals.length > 0 ? nearbyHospitals : allMergedHospitals.slice(0, 6)}
+                        nearbyResources={
+                          nearbyFirestoreResources.withinRadius.length > 0
+                            ? nearbyFirestoreResources.withinRadius
+                            : nearbyFirestoreResources.outsideRadiusFallback
+                        }
+                        selectedHospitalId={selectedProviderId}
+                        onSelectHospital={handleSelectProvider}
+                        searchRadiusKm={DEFAULT_SEARCH_RADIUS_KM}
+                      />
+                    )}
+                  </div>
 
-                              <div className="flex items-center gap-2 text-xs text-slate-600 flex-wrap">
-                                <span>Updated: <span className="font-medium text-slate-800">{hospital.latestUpdate}</span></span>
-                                <span>•</span>
-                                <span>Rating: <span className="font-semibold text-slate-800">{hospital.rating}</span></span>
-                                <span>•</span>
-                                <a
-                                  href={getGoogleMapsDirectionsUrl(hospital, searchLocation)}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="text-[#00707E] font-medium hover:underline inline-flex items-center gap-0.5"
-                                >
-                                  View on Map <ExternalLink className="h-2.5 w-2.5" />
-                                </a>
-                              </div>
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => handleSelectProvider(hospital.id)}
-                              className={`px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-xs shrink-0 self-start sm:self-center ${
-                                isSelected
-                                  ? 'bg-[#005863] text-white ring-2 ring-teal-400'
-                                  : 'bg-[#00707E] hover:bg-[#005B66] text-white'
-                              }`}
-                            >
-                              {isSelected ? 'Selected ✓' : 'Select Provider'}
-                            </button>
+                  {/* Prompt before GPS / manual coordinates are provided */}
+                  {!patientGpsReading ? (
+                    <div className="bg-white rounded-2xl p-6 text-center border border-dashed border-teal-300 mb-4 space-y-2.5">
+                      <div className="w-12 h-12 mx-auto rounded-2xl bg-teal-50 border border-teal-200 text-[#00707E] flex items-center justify-center">
+                        <Navigation className="h-6 w-6" />
+                      </div>
+                      <h3 className="text-sm font-extrabold text-slate-900">
+                        Share GPS Location to Calculate Real Distances
+                      </h3>
+                      <p className="text-xs text-slate-600 max-w-md mx-auto leading-relaxed">
+                        Click <strong>Use My Current GPS Location</strong> above to grant location access, capture your actual latitude and longitude, and view eligible hospitals within a <strong>{DEFAULT_SEARCH_RADIUS_KM} km radius</strong> — or enter your street address / coordinates manually.
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Fallback Notice if no eligible hospital exists within 2 km */}
+                      {coordinateSearchResult?.usedOutsideRadiusFallback && (
+                        <div className="mb-3 p-3 rounded-2xl bg-indigo-50 border border-indigo-200 text-indigo-950 text-xs flex items-start gap-2.5">
+                          <AlertTriangle className="h-4 w-4 text-indigo-600 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="font-bold">
+                              No eligible hospital with your selected resources was found within {DEFAULT_SEARCH_RADIUS_KM} km.
+                            </p>
+                            <p className="text-[11px] text-indigo-800 mt-0.5">
+                              Showing the closest eligible hospitals outside the {DEFAULT_SEARCH_RADIUS_KM} km radius sorted by exact geographical distance so you still have options.
+                            </p>
                           </div>
                         </div>
-                      );
-                    })}
-                  </div>
+                      )}
+
+                      {/* Eligible Hospitals List (Within 2 km or Closest Fallback Outside 2 km) */}
+                      <div className="space-y-2.5 max-h-[340px] overflow-y-auto pr-1 mb-3 scrollbar-thin">
+                        {nearbyHospitals.length === 0 ? (
+                          <div className="bg-white rounded-2xl p-6 text-center border border-slate-200 text-xs text-slate-500">
+                            No eligible hospitals match the currently toggled resources. Try adjusting your resource toggles on the left.
+                          </div>
+                        ) : (
+                          nearbyHospitals.map((hospital) => {
+                            const isSelected = selectedProviderId === hospital.id;
+                            const isWithin2Km = hospital.withinSearchRadius ?? hospital.distanceKm <= DEFAULT_SEARCH_RADIUS_KM;
+                            const originStr = `${patientGpsReading.lat},${patientGpsReading.lng}`;
+                            return (
+                              <div
+                                key={hospital.id}
+                                className={`p-3.5 rounded-2xl bg-white border transition-all ${
+                                  isSelected
+                                    ? 'border-[#00707E] ring-2 ring-[#00707E]/30 shadow-sm bg-teal-50/20'
+                                    : 'border-slate-200/80 hover:border-slate-300 shadow-2xs'
+                                }`}
+                              >
+                                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                                      <h3 className="font-bold text-slate-900 text-sm sm:text-base leading-snug">
+                                        {hospital.name}
+                                      </h3>
+                                      <span
+                                        className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                                          isWithin2Km
+                                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                            : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                                        }`}
+                                      >
+                                        {isWithin2Km
+                                          ? `Within ${DEFAULT_SEARCH_RADIUS_KM} km`
+                                          : `Outside ${DEFAULT_SEARCH_RADIUS_KM} km`}
+                                      </span>
+                                      {hospital.isLiveFirestoreData && (
+                                        <span className="inline-flex items-center gap-0.5 text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-800 border border-teal-200">
+                                          <Database className="w-2.5 h-2.5" /> Live Firestore
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    <p className="text-xs text-slate-600 flex items-start gap-1 mb-1">
+                                      <MapPin className="h-3.5 w-3.5 text-slate-400 shrink-0 mt-0.5" />
+                                      <span>{hospital.address}</span>
+                                    </p>
+
+                                    <p className="text-xs font-bold text-[#00707E] mb-2">
+                                      {formatDistanceKm(hospital.distanceKm)} from your location • Est. travel: ~{hospital.etaMins} mins
+                                    </p>
+
+                                    {/* General Beds & ICU Beds Availability Highlight Row */}
+                                    <div className="grid grid-cols-2 gap-2 mb-2">
+                                      <div className="px-2.5 py-1.5 rounded-xl bg-teal-50 border border-teal-200 flex items-center justify-between text-xs">
+                                        <span className="inline-flex items-center gap-1 font-semibold text-teal-900">
+                                          <Bed className="h-3.5 w-3.5 text-teal-700" />
+                                          General Beds
+                                        </span>
+                                        <span className="font-extrabold text-teal-950">
+                                          {hospital.availableResources.beds}
+                                          <span className="text-[10px] font-medium text-teal-700">
+                                            /{hospital.availableResources.totalBeds}
+                                          </span>
+                                        </span>
+                                      </div>
+
+                                      <div className="px-2.5 py-1.5 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center justify-between text-xs">
+                                        <span className="inline-flex items-center gap-1 font-semibold text-indigo-900">
+                                          <HeartPulse className="h-3.5 w-3.5 text-indigo-600" />
+                                          ICU Beds
+                                        </span>
+                                        <span className="font-extrabold text-indigo-950">
+                                          {hospital.availableResources.icu}
+                                          <span className="text-[10px] font-medium text-indigo-700">
+                                            /{hospital.availableResources.totalIcu}
+                                          </span>
+                                        </span>
+                                      </div>
+                                    </div>
+
+                                    {/* Secondary Resources Summary */}
+                                    <div className="flex flex-wrap gap-1.5 mb-2">
+                                      {typeof hospital.availableResources.ventilators === 'number' && hospital.availableResources.ventilators > 0 && (
+                                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 text-slate-800 border border-slate-200">
+                                          Ventilators: {hospital.availableResources.ventilators}
+                                        </span>
+                                      )}
+                                      {hospital.availableResources.bloodUnits > 0 && (
+                                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-rose-50 text-rose-900 border border-rose-200">
+                                          Blood: {hospital.availableResources.bloodUnits} units
+                                        </span>
+                                      )}
+                                      {hospital.availableResources.oxygenTanks > 0 && (
+                                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-cyan-50 text-cyan-900 border border-cyan-200">
+                                          Oxygen: {hospital.availableResources.oxygenTanks} tanks
+                                        </span>
+                                      )}
+                                      {hospital.availableResources.ambulances > 0 && (
+                                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-amber-50 text-amber-900 border border-amber-200">
+                                          Ambulances: {hospital.availableResources.ambulances}
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    <div className="flex items-center gap-2 text-[11px] text-slate-500 flex-wrap">
+                                      <span>Updated: <span className="font-semibold text-slate-700">{hospital.latestUpdate}</span></span>
+                                      <span>•</span>
+                                      <a
+                                        href={getGoogleMapsDirectionsUrl(hospital, originStr)}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-[#00707E] font-semibold hover:underline inline-flex items-center gap-0.5"
+                                      >
+                                        Directions <ExternalLink className="h-2.5 w-2.5" />
+                                      </a>
+                                    </div>
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSelectProvider(hospital.id)}
+                                    className={`px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-xs shrink-0 self-start sm:self-center cursor-pointer ${
+                                      isSelected
+                                        ? 'bg-[#0F3868] text-white ring-2 ring-teal-400'
+                                        : 'bg-[#00707E] hover:bg-[#005B66] text-white'
+                                    }`}
+                                  >
+                                    {isSelected ? 'Selected ✓' : 'Select Hospital'}
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      {/* Nearby Live Firestore Emergency Resources (Blood Banks, Oxygen, Ambulances) */}
+                      {(nearbyFirestoreResources.withinRadius.length > 0 ||
+                        nearbyFirestoreResources.outsideRadiusFallback.length > 0) && (
+                        <div className="mb-4 bg-white rounded-2xl p-3.5 border border-slate-200/80 space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                              <Database className="h-3.5 w-3.5 text-[#00707E]" />
+                              <span>
+                                {nearbyFirestoreResources.withinRadius.length > 0
+                                  ? `Live Emergency Resources Within ${DEFAULT_SEARCH_RADIUS_KM} km`
+                                  : `Nearest Live Emergency Resources (Outside ${DEFAULT_SEARCH_RADIUS_KM} km)`}
+                              </span>
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {(nearbyFirestoreResources.withinRadius.length > 0
+                              ? nearbyFirestoreResources.withinRadius
+                              : nearbyFirestoreResources.outsideRadiusFallback.slice(0, 4)
+                            ).map((res) => (
+                              <div
+                                key={res.id}
+                                className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-[11px] space-y-0.5"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="font-bold text-slate-900 truncate flex items-center gap-1">
+                                    {res.resourceKind === 'bloodBank' && <Droplet className="h-3 w-3 text-rose-600 shrink-0" />}
+                                    {res.resourceKind === 'oxygenProvider' && <Wind className="h-3 w-3 text-sky-600 shrink-0" />}
+                                    {res.resourceKind === 'ambulanceProvider' && <Truck className="h-3 w-3 text-amber-600 shrink-0" />}
+                                    <span className="truncate">{res.name}</span>
+                                  </span>
+                                  <span className="font-mono font-bold text-[#00707E] shrink-0">
+                                    {formatDistanceKm(res.distanceKm)}
+                                  </span>
+                                </div>
+                                <p className="text-slate-600">{res.availabilitySummary}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
 
-                {/* Confirm & Proceed Button (Matches Screenshot 2: wide full-width teal button at bottom of panel) */}
+                {/* Confirm & Proceed Button */}
                 <button
                   type="button"
                   onClick={() => setCurrentScreen('case-details')}
-                  className="w-full py-3.5 px-6 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white font-bold text-sm sm:text-base shadow-md transition-all active:scale-[0.99] text-center"
+                  className="w-full py-3.5 px-6 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white font-bold text-sm sm:text-base shadow-md transition-all active:scale-[0.99] text-center cursor-pointer"
                 >
-                  Confirm & Proceed with Selection
+                  {selectedHospital
+                    ? `Confirm & Proceed with ${selectedHospital.name}`
+                    : 'Confirm & Proceed with Selection'}
                 </button>
               </div>
 
@@ -3991,6 +4481,17 @@ function CareBridgeApp() {
                   >
                     <Bell className="h-3.5 w-3.5" />
                     <span>Notifications</span>
+                    {(dashboardNotifications.filter((n) => !n.isRead).length + completedCasesPendingFeedback.length) > 0 && (
+                      <span
+                        className={`px-1.5 py-0.5 rounded-full text-[10px] font-extrabold ${
+                          dashboardTab === 'notifications'
+                            ? 'bg-white text-[#00707E]'
+                            : 'bg-amber-500 text-white'
+                        }`}
+                      >
+                        {dashboardNotifications.filter((n) => !n.isRead).length + completedCasesPendingFeedback.length}
+                      </span>
+                    )}
                   </button>
 
                   <button
@@ -4033,6 +4534,81 @@ function CareBridgeApp() {
 
             {/* Main Dashboard Content Area */}
             <div className="flex-1 max-w-7xl mx-auto w-full p-4 sm:p-6 lg:p-8 space-y-6">
+
+              {/* Completed Emergency Feedback Notification Banner (Optional, Non-Blocking) */}
+              {visibleFeedbackNotices.length > 0 && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="bg-gradient-to-r from-amber-50 via-white to-teal-50 border border-amber-300 rounded-2xl p-4 sm:p-5 shadow-xs space-y-3"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-3">
+                      <div className="h-10 w-10 rounded-xl bg-amber-100 border border-amber-300 text-amber-700 flex items-center justify-center shrink-0">
+                        <Star className="h-5 w-5 fill-amber-400 text-amber-500" />
+                      </div>
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h3 className="text-sm sm:text-base font-extrabold text-slate-900">
+                            Emergency Case Completed — Share Your Feedback
+                          </h3>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-800 border border-emerald-200">
+                            Optional
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-600 mt-0.5">
+                          {visibleFeedbackNotices.length === 1
+                            ? `Emergency case ${visibleFeedbackNotices[0].caseId} is marked completed. A feedback form is now available to rate your overall experience, hospital/provider care, ambulance service (where applicable), and response time.`
+                            : `You have ${visibleFeedbackNotices.length} completed emergency cases with an optional feedback form available.`}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDismissedFeedbackNoticeIds((prev) =>
+                          Array.from(new Set([...prev, ...visibleFeedbackNotices.map((c) => c.caseId)]))
+                        )
+                      }
+                      aria-label="Dismiss feedback notification"
+                      className="text-slate-400 hover:text-slate-600 p-1 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                      title="Dismiss for now"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {visibleFeedbackNotices.map((completedCase) => (
+                      <div
+                        key={completedCase.caseId}
+                        className="flex flex-wrap items-center justify-between gap-3 bg-white border border-amber-200 rounded-xl px-3.5 py-2.5 flex-1 min-w-[260px]"
+                      >
+                        <div className="text-xs">
+                          <span className="font-mono font-extrabold text-[#0F3868]">
+                            {completedCase.caseId}
+                          </span>
+                          <span className="text-slate-400 mx-1.5">•</span>
+                          <span className="font-semibold text-slate-800">{completedCase.patientName}</span>
+                          {completedCase.assignedHospitalName && (
+                            <span className="text-slate-500 block text-[11px] mt-0.5">
+                              Hospital: {completedCase.assignedHospitalName}
+                            </span>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setFeedbackModalCase(completedCase)}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#00707E] hover:bg-[#005B66] text-white text-xs font-bold shadow-2xs transition-colors cursor-pointer"
+                        >
+                          <Star className="h-3.5 w-3.5 fill-amber-300 text-amber-300" />
+                          <span>Give Feedback</span>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* TAB 1: MY EMERGENCY CASES & RESOURCE SUMMARY */}
               {dashboardTab === 'cases' && (
@@ -4272,18 +4848,42 @@ function CareBridgeApp() {
                                 ))}
                               </div>
 
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setSelectedCaseFromHistory(false);
-                                  setSelectedDashboardCase(c);
-                                }}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-[#00707E] hover:text-white text-slate-800 text-xs font-bold transition-all"
-                              >
-                                <Eye className="h-3.5 w-3.5" />
-                                <span>View Case Details</span>
-                                <ChevronRight className="h-3.5 w-3.5" />
-                              </button>
+                              <div className="flex flex-wrap items-center gap-2">
+                                {isCaseCompletedStatus(c.status) && (
+                                  feedbackByCaseId[c.caseId] ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => setFeedbackModalCase(c)}
+                                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold transition-all cursor-pointer"
+                                    >
+                                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                                      <span>Feedback Submitted ({feedbackByCaseId[c.caseId].overallRating}/5)</span>
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setFeedbackModalCase(c)}
+                                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 text-xs font-bold transition-all cursor-pointer"
+                                    >
+                                      <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" />
+                                      <span>Give Feedback</span>
+                                    </button>
+                                  )
+                                )}
+
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedCaseFromHistory(false);
+                                    setSelectedDashboardCase(c);
+                                  }}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-[#00707E] hover:text-white text-slate-800 text-xs font-bold transition-all"
+                                >
+                                  <Eye className="h-3.5 w-3.5" />
+                                  <span>View Case Details</span>
+                                  <ChevronRight className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
                             </div>
                           </div>
                         ))}
@@ -4664,34 +5264,137 @@ function CareBridgeApp() {
                     </button>
                   </div>
 
-                  {casesList.length === 0 ? (
+                  {completedCasesPendingFeedback.length === 0 && dashboardNotifications.length === 0 && casesList.length === 0 ? (
                     <div className="text-center py-10 px-4 max-w-md mx-auto">
                       <div className="h-12 w-12 rounded-2xl bg-slate-50 border border-slate-200 text-slate-400 flex items-center justify-center mx-auto mb-3">
                         <Bell className="h-6 w-6" />
                       </div>
                       <h3 className="font-bold text-slate-900 text-sm">No Notifications</h3>
                       <p className="text-xs text-slate-500 mt-1">
-                        All caught up. Live dispatch notifications and triage alerts will appear here when an emergency case is initiated.
+                        All caught up. Live dispatch notifications, case completion alerts, and optional feedback invitations will appear here.
                       </p>
                     </div>
                   ) : (
                     <div className="space-y-3">
-                      {casesList.map((c) => (
-                        <div key={c.caseId} className="p-3.5 rounded-xl bg-teal-50 border border-teal-200 flex items-start gap-3">
-                          <div className="h-8 w-8 rounded-lg bg-teal-600 text-white flex items-center justify-center shrink-0">
-                            <Check className="h-4 w-4" />
-                          </div>
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs font-bold text-slate-900">Case {c.caseId} Active Dispatch</span>
-                              <span className="text-[10px] text-slate-400">{c.createdAt}</span>
+                      {/* Feedback Available Notifications for Completed Cases */}
+                      {completedCasesPendingFeedback.map((c) => (
+                        <div
+                          key={`fb-notif-${c.caseId}`}
+                          className="p-4 rounded-xl bg-amber-50 border border-amber-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                        >
+                          <div className="flex items-start gap-3">
+                            <div className="h-9 w-9 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0">
+                              <Star className="h-4 w-4 fill-white" />
                             </div>
-                            <p className="text-xs text-slate-600 mt-0.5">
-                              Emergency dispatch ongoing for {c.patientName} at {c.providerName}.
-                            </p>
+                            <div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-xs font-extrabold text-slate-900">
+                                  Case {c.caseId} Completed — Feedback Form Available
+                                </span>
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                  Optional
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-700 mt-0.5">
+                                Your emergency case for {c.patientName} has reached completed status. Share your experience rating and suggestions to help improve care.
+                              </p>
+                            </div>
                           </div>
+                          <button
+                            type="button"
+                            onClick={() => setFeedbackModalCase(c)}
+                            className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white text-xs font-bold shadow-xs shrink-0 cursor-pointer"
+                          >
+                            <MessageSquare className="h-3.5 w-3.5" />
+                            <span>Open Feedback Form</span>
+                          </button>
                         </div>
                       ))}
+
+                      {/* Live Firestore / DataStore Notifications */}
+                      {dashboardNotifications.map((notif) => {
+                        const relatedCase = casesList.find(
+                          (c) => c.caseId === (notif.relatedCaseId || notif.emergencyId)
+                        );
+                        const canOpenFeedback =
+                          relatedCase &&
+                          isCaseCompletedStatus(relatedCase.status) &&
+                          !feedbackByCaseId[relatedCase.caseId];
+                        return (
+                          <div
+                            key={notif.id}
+                            onClick={() => {
+                              if (!notif.isRead) void markNotificationReadInFirestore(notif.id);
+                            }}
+                            className={`p-3.5 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-colors ${
+                              notif.isRead
+                                ? 'bg-white border-slate-200'
+                                : 'bg-teal-50/70 border-teal-200'
+                            }`}
+                          >
+                            <div className="flex items-start gap-3">
+                              <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 ${
+                                notif.type === 'feedback_available' || isCaseCompletedStatus(notif.newStatus)
+                                  ? 'bg-amber-500 text-white'
+                                  : 'bg-teal-600 text-white'
+                              }`}>
+                                {notif.type === 'feedback_available' || isCaseCompletedStatus(notif.newStatus) ? (
+                                  <Star className="h-4 w-4" />
+                                ) : (
+                                  <Check className="h-4 w-4" />
+                                )}
+                              </div>
+                              <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-xs font-bold text-slate-900">{notif.title}</span>
+                                  <span className="text-[10px] text-slate-400">
+                                    {new Date(notif.createdAt).toLocaleString()}
+                                  </span>
+                                  {!notif.isRead && (
+                                    <span className="h-2 w-2 rounded-full bg-teal-600" />
+                                  )}
+                                </div>
+                                <p className="text-xs text-slate-600 mt-0.5">{notif.message}</p>
+                              </div>
+                            </div>
+                            {canOpenFeedback && relatedCase && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (!notif.isRead) void markNotificationReadInFirestore(notif.id);
+                                  setFeedbackModalCase(relatedCase);
+                                }}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 text-xs font-bold shrink-0 cursor-pointer"
+                              >
+                                <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" />
+                                <span>Give Feedback</span>
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                      {/* Active Case Dispatch Fallback Summaries */}
+                      {dashboardNotifications.length === 0 &&
+                        casesList
+                          .filter((c) => !isCaseCompletedStatus(c.status))
+                          .map((c) => (
+                            <div key={c.caseId} className="p-3.5 rounded-xl bg-teal-50 border border-teal-200 flex items-start gap-3">
+                              <div className="h-8 w-8 rounded-lg bg-teal-600 text-white flex items-center justify-center shrink-0">
+                                <Check className="h-4 w-4" />
+                              </div>
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-bold text-slate-900">Case {c.caseId} Active Dispatch</span>
+                                  <span className="text-[10px] text-slate-400">{c.createdAt}</span>
+                                </div>
+                                <p className="text-xs text-slate-600 mt-0.5">
+                                  Emergency dispatch ongoing for {c.patientName} at {c.providerName}.
+                                </p>
+                              </div>
+                            </div>
+                          ))}
                     </div>
                   )}
                 </div>
@@ -4846,14 +5549,37 @@ function CareBridgeApp() {
                                 </div>
                               )}
                             </div>
-                            <button
-                              type="button"
-                              onClick={() => openHistoryDetails(record)}
-                              className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-xs font-bold text-[#00707E] hover:bg-teal-100"
-                            >
-                              <Eye className="h-3.5 w-3.5" />
-                              Open details
-                            </button>
+                            <div className="flex flex-wrap sm:flex-col items-stretch gap-2 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => openHistoryDetails(record)}
+                                className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-xs font-bold text-[#00707E] hover:bg-teal-100"
+                              >
+                                <Eye className="h-3.5 w-3.5" />
+                                Open details
+                              </button>
+                              {isCaseCompletedStatus(record.status) && (
+                                feedbackByCaseId[record.caseId] ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => openFeedbackForHistoryRecord(record)}
+                                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-800 hover:bg-emerald-100 cursor-pointer"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                                    Feedback ({feedbackByCaseId[record.caseId].overallRating}/5)
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => openFeedbackForHistoryRecord(record)}
+                                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900 hover:bg-amber-100 cursor-pointer"
+                                  >
+                                    <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" />
+                                    Give Feedback
+                                  </button>
+                                )
+                              )}
+                            </div>
                           </div>
                         </article>
                       ))}
@@ -5059,6 +5785,41 @@ function CareBridgeApp() {
 
                   {/* Action Buttons */}
                   <div className="space-y-2 pt-2 border-t border-slate-100">
+                    {isCaseCompletedStatus(selectedDashboardCase.status) && (
+                      <div className="pb-1">
+                        {feedbackByCaseId[selectedDashboardCase.caseId] ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const target = selectedDashboardCase;
+                              setSelectedCaseFromHistory(false);
+                              setSelectedDashboardCase(null);
+                              setFeedbackModalCase(target);
+                            }}
+                            className="w-full py-2.5 px-3 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 font-bold text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                            <span>
+                              View Submitted Feedback ({feedbackByCaseId[selectedDashboardCase.caseId].overallRating}/5 Stars)
+                            </span>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const target = selectedDashboardCase;
+                              setSelectedCaseFromHistory(false);
+                              setSelectedDashboardCase(null);
+                              setFeedbackModalCase(target);
+                            }}
+                            className="w-full py-2.5 px-3 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 font-bold text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            <Star className="h-4 w-4 fill-amber-400 text-amber-500" />
+                            <span>Share Optional Feedback for This Completed Case</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
                     <div className="flex gap-2">
                       <button
                         type="button"
@@ -5084,6 +5845,25 @@ function CareBridgeApp() {
 
                 </div>
               </div>
+            )}
+
+            {/* ============================================================== */}
+            {/* COMPLETED CASE PATIENT FEEDBACK MODAL                          */}
+            {/* ============================================================== */}
+            {feedbackModalCase && currentUser && (
+              <CaseFeedbackModal
+                emergencyCase={feedbackModalCase}
+                caseRequests={requestsList.filter((r) => r.caseId === feedbackModalCase.caseId)}
+                currentUser={currentUser}
+                existingFeedback={feedbackByCaseId[feedbackModalCase.caseId] || null}
+                onClose={() => setFeedbackModalCase(null)}
+                onSubmitted={(saved) => {
+                  setSubmittedFeedbackList((prev) => [
+                    saved,
+                    ...prev.filter((item) => item.caseId !== saved.caseId)
+                  ]);
+                }}
+              />
             )}
 
             {/* ============================================================== */}

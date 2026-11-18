@@ -225,6 +225,9 @@ exports.sendEmergencyPushNotification = onDocumentCreated({
 
 function pushMessage(notification) {
   if (notification.type === 'emergency_status_updated') {
+    if (notification.newStatus === 'COMPLETED') {
+      return `Emergency ${notification.emergencyId} is completed. Optional patient feedback is now available on your dashboard.`;
+    }
     return `Emergency ${notification.emergencyId} status updated to ${notification.newStatus}.`;
   }
   if (notification.type === 'request_assigned') {
@@ -296,14 +299,21 @@ exports.createEmergencyStatusNotifications = onDocumentUpdated({
       if (notificationSnapshot.exists) return;
       const recipientUid = [...recipientUids][index];
       const reason = typeof lifecycleEvent.reason === 'string' ? lifecycleEvent.reason : '';
+      const isCompleted = after.status === 'COMPLETED';
       transaction.create(notificationRefs[index], {
         recipientUid,
         type: 'emergency_status_updated',
         eventType: 'case_status',
         eventId,
-        title: `Emergency status: ${String(after.status).replaceAll('_', ' ')}`,
-        message: `Emergency ${caseId} changed from ${before.status} to ${after.status}${reason ? `: ${reason}` : '.'}`,
-        details: reason || `Status changed from ${before.status} to ${after.status}.`,
+        title: isCompleted
+          ? `Emergency ${caseId} Completed — Feedback Available`
+          : `Emergency status: ${String(after.status).replaceAll('_', ' ')}`,
+        message: isCompleted
+          ? `Emergency ${caseId} has been marked completed. An optional feedback form is now available on your dashboard to rate your experience.`
+          : `Emergency ${caseId} changed from ${before.status} to ${after.status}${reason ? `: ${reason}` : '.'}`,
+        details: reason || (isCompleted
+          ? 'Emergency case completed. Optional feedback form is now available.'
+          : `Status changed from ${before.status} to ${after.status}.`),
         previousStatus: before.status,
         newStatus: after.status,
         emergencyId: caseId,
