@@ -1,0 +1,2232 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  Shield,
+  Users,
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Building2,
+  Filter,
+  Search,
+  Check,
+  X,
+  RefreshCw,
+  MapPin,
+  Lock,
+  Unlock,
+  Truck,
+  Droplet,
+  Wind,
+  Bed,
+  FileText,
+  ChevronRight,
+  ExternalLink,
+  Sliders,
+  Send,
+  Edit2,
+  XCircle,
+  CheckCircle
+} from 'lucide-react';
+import { useAuth } from '../../context/AuthContext';
+import {
+  dataStore,
+  getAllowedEmergencyCaseTransitions,
+  subscribeHospitalProfilesFromFirestore,
+  subscribeBloodBankProfilesFromFirestore,
+  subscribeOxygenProfilesFromFirestore,
+  subscribeAmbulanceProfilesFromFirestore,
+  subscribeProviderUpdateRequests,
+  INITIAL_HOSPITAL,
+  INITIAL_BLOOD_BANK,
+  INITIAL_OXYGEN,
+  INITIAL_AMBULANCE
+} from '../../services/dataService';
+import type {
+  UserProfile,
+  EmergencyCase,
+  ResourceRequest,
+  HospitalProfile,
+  BloodBankProfile,
+  OxygenProfile,
+  AmbulanceProfile,
+  CaseStatus,
+  EmergencyPriority,
+  ResourceAssignmentAudit,
+  EmergencyLifecycleEvent,
+  EmergencyLifecycleStatus,
+  ProviderUpdateRequest
+} from '../../types';
+import type { EligibleResourceProvider } from '../../services/dataService';
+
+type CoordinatorResourceFilter = 'all' | 'hospital' | 'blood' | 'oxygen' | 'ambulance' | 'doctor';
+
+const resourceGroups: { id: Exclude<CoordinatorResourceFilter, 'all'>; label: string; resourceTypes: ResourceRequest['resourceType'][] }[] = [
+  { id: 'hospital', label: 'Hospital', resourceTypes: ['bed', 'icu'] },
+  { id: 'blood', label: 'Blood', resourceTypes: ['blood'] },
+  { id: 'oxygen', label: 'Oxygen', resourceTypes: ['oxygen'] },
+  { id: 'ambulance', label: 'Ambulance', resourceTypes: ['ambulance'] },
+  { id: 'doctor', label: 'Doctor', resourceTypes: ['doctor'] }
+];
+
+const formatDate = (date: string) => {
+  const parsed = new Date(date);
+  return Number.isNaN(parsed.getTime()) ? 'Date unavailable' : parsed.toLocaleString();
+};
+
+export const AdminDashboard: React.FC = () => {
+  const { currentUser } = useAuth();
+  const [activeTab, setActiveTab] = useState<'emergencies' | 'providers' | 'users' | 'analytics' | 'coordinator'>('emergencies');
+
+  // Core Data
+  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [cases, setCases] = useState<EmergencyCase[]>([]);
+  const [requests, setRequests] = useState<ResourceRequest[]>([]);
+  const [hospitals, setHospitals] = useState<HospitalProfile[]>([]);
+  const [bloodBanks, setBloodBanks] = useState<BloodBankProfile[]>([]);
+  const [oxygenDepots, setOxygenDepots] = useState<OxygenProfile[]>([]);
+  const [ambulances, setAmbulances] = useState<AmbulanceProfile[]>([]);
+  const [providerUpdates, setProviderUpdates] = useState<ProviderUpdateRequest[]>([]);
+  const [coordinatorCases, setCoordinatorCases] = useState<EmergencyCase[]>([]);
+  const [coordinatorRequests, setCoordinatorRequests] = useState<ResourceRequest[]>([]);
+  const [coordinatorLoading, setCoordinatorLoading] = useState(true);
+  const [coordinatorError, setCoordinatorError] = useState<string | null>(null);
+  const [coordinatorRefresh, setCoordinatorRefresh] = useState(0);
+  const [coordinatorPriorityFilter, setCoordinatorPriorityFilter] = useState('all');
+  const [coordinatorStatusFilter, setCoordinatorStatusFilter] = useState('all');
+  const [resourceFilter, setResourceFilter] = useState<CoordinatorResourceFilter>('all');
+  const [dateFromFilter, setDateFromFilter] = useState('');
+  const [dateToFilter, setDateToFilter] = useState('');
+  const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
+  // Search & Filtering
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [priorityFilter, setPriorityFilter] = useState<string>('all');
+  const [userRoleFilter, setUserRoleFilter] = useState<string>('all');
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [verifyingUid, setVerifyingUid] = useState<string | null>(null);
+  const [assignmentRequest, setAssignmentRequest] = useState<ResourceRequest | null>(null);
+  const [eligibleAssignmentProviders, setEligibleAssignmentProviders] = useState<EligibleResourceProvider[]>([]);
+  const [selectedAssignmentProviderUid, setSelectedAssignmentProviderUid] = useState('');
+  const [assignmentReason, setAssignmentReason] = useState('');
+  const [assignmentHistory, setAssignmentHistory] = useState<ResourceAssignmentAudit[]>([]);
+  const [isLoadingAssignment, setIsLoadingAssignment] = useState(false);
+  const [isSavingAssignment, setIsSavingAssignment] = useState(false);
+  const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  const [lifecycleEvents, setLifecycleEvents] = useState<EmergencyLifecycleEvent[]>([]);
+  const [lifecycleLoading, setLifecycleLoading] = useState(false);
+  const [lifecycleError, setLifecycleError] = useState<string | null>(null);
+  const [nextLifecycleStatus, setNextLifecycleStatus] = useState<EmergencyLifecycleStatus | ''>('');
+  const [lifecycleReason, setLifecycleReason] = useState('');
+  const [isSavingLifecycleStatus, setIsSavingLifecycleStatus] = useState(false);
+
+  // Selected Case for Details & Assignment Modal
+  const [selectedCase, setSelectedCase] = useState<EmergencyCase | null>(null);
+  const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
+
+  // Assignment Drawer selections
+  const [assignHospitalId, setAssignHospitalId] = useState('');
+  const [assignBloodBankId, setAssignBloodBankId] = useState('');
+  const [assignOxygenId, setAssignOxygenId] = useState('');
+  const [assignAmbulanceId, setAssignAmbulanceId] = useState('');
+  const [assignNote, setAssignNote] = useState('');
+  const [isSubmittingAssignment, setIsSubmittingAssignment] = useState(false);
+
+  // Provider capacity update review & adjustment state
+  const [editingUpdateId, setEditingUpdateId] = useState<string | null>(null);
+  const [adjustedDetails, setAdjustedDetails] = useState<Record<string, any>>({});
+  const [adminReviewNotes, setAdminReviewNotes] = useState<Record<string, string>>({});
+  const [processingUpdateId, setProcessingUpdateId] = useState<string | null>(null);
+
+  const loadData = () => {
+    setUsers(dataStore.getUsers());
+    setCases(dataStore.getCases());
+    setCoordinatorCases(dataStore.getCases());
+    setRequests(dataStore.getRequests());
+    setCoordinatorRequests(dataStore.getRequests());
+    setHospitals(dataStore.getAllHospitalProfiles());
+    setBloodBanks(dataStore.getAllBloodBankProfiles());
+    setOxygenDepots(dataStore.getAllOxygenProfiles());
+    setAmbulances(dataStore.getAllAmbulanceProfiles());
+    setProviderUpdates(dataStore.getProviderUpdateRequests());
+  };
+
+  useEffect(() => {
+    loadData();
+    const unsubscribeLocal = dataStore.subscribe(loadData);
+    const unsubHosp = subscribeHospitalProfilesFromFirestore(setHospitals);
+    const unsubBlood = subscribeBloodBankProfilesFromFirestore(setBloodBanks);
+    const unsubOxy = subscribeOxygenProfilesFromFirestore(setOxygenDepots);
+    const unsubAmb = subscribeAmbulanceProfilesFromFirestore(setAmbulances);
+    const unsubUpdates = subscribeProviderUpdateRequests(setProviderUpdates);
+
+    if (!currentUser || currentUser.role !== 'admin') {
+      setCoordinatorCases([]);
+      setCoordinatorRequests([]);
+      setCoordinatorLoading(false);
+      setCoordinatorError('Coordinator data requires an authenticated admin account.');
+      return () => {
+        unsubscribeLocal();
+        unsubHosp();
+        unsubBlood();
+        unsubOxy();
+        unsubAmb();
+        unsubUpdates();
+      };
+    }
+
+    let receivedUsers = false;
+    let receivedCases = false;
+    let receivedRequests = false;
+    setCoordinatorLoading(true);
+    setCoordinatorError(null);
+    const unsubscribe = dataStore.subscribeToCoordinatorCasesAndRequests(
+      (records) => {
+        setUsers(records);
+        receivedUsers = true;
+        if (receivedCases && receivedRequests) setCoordinatorLoading(false);
+      },
+      (records) => {
+        setCoordinatorCases(records);
+        setCases(records);
+        receivedCases = true;
+        if (receivedUsers && receivedRequests) setCoordinatorLoading(false);
+      },
+      (records) => {
+        setCoordinatorRequests(records);
+        setRequests(records);
+        receivedRequests = true;
+        if (receivedUsers && receivedCases) setCoordinatorLoading(false);
+      },
+      (message) => {
+        setCoordinatorError(message);
+        setCoordinatorLoading(false);
+      }
+    );
+    return () => {
+      unsubscribe();
+      unsubscribeLocal();
+      unsubHosp();
+      unsubBlood();
+      unsubOxy();
+      unsubAmb();
+      unsubUpdates();
+    };
+  }, [currentUser?.uid, currentUser?.role, coordinatorRefresh]);
+
+  // Consolidate all verified & registered healthcare facility providers for dispatch and telemetry
+  const allHospitals = useMemo(() => {
+    const map = new Map<string, HospitalProfile>();
+    if (INITIAL_HOSPITAL) {
+      map.set(INITIAL_HOSPITAL.uid, INITIAL_HOSPITAL);
+    }
+    hospitals.forEach((h) => {
+      if (h && h.uid) map.set(h.uid, h);
+    });
+    users
+      .filter((u) => u.role === 'hospital')
+      .forEach((u) => {
+        const existing = map.get(u.uid);
+        if (existing) {
+          if (u.displayName && (existing.hospitalName === INITIAL_HOSPITAL.hospitalName || !existing.hospitalName)) {
+            existing.hospitalName = u.displayName;
+          }
+        } else {
+          const prof = dataStore.getHospitalProfile(u.uid);
+          if (prof) {
+            if (u.displayName) prof.hospitalName = u.displayName;
+            map.set(prof.uid, prof);
+          }
+        }
+      });
+    return Array.from(map.values());
+  }, [hospitals, users]);
+
+  const allBloodBanks = useMemo(() => {
+    const map = new Map<string, BloodBankProfile>();
+    if (INITIAL_BLOOD_BANK) {
+      map.set(INITIAL_BLOOD_BANK.uid, INITIAL_BLOOD_BANK);
+    }
+    bloodBanks.forEach((b) => {
+      if (b && b.uid) map.set(b.uid, b);
+    });
+    users
+      .filter((u) => u.role === 'bloodBank')
+      .forEach((u) => {
+        const existing = map.get(u.uid);
+        if (existing) {
+          if (u.displayName && (existing.bankName === INITIAL_BLOOD_BANK.bankName || !existing.bankName)) {
+            existing.bankName = u.displayName;
+          }
+        } else {
+          const prof = dataStore.getBloodBankProfile(u.uid);
+          if (prof) {
+            if (u.displayName) prof.bankName = u.displayName;
+            map.set(prof.uid, prof);
+          }
+        }
+      });
+    return Array.from(map.values());
+  }, [bloodBanks, users]);
+
+  const allOxygenDepots = useMemo(() => {
+    const map = new Map<string, OxygenProfile>();
+    if (INITIAL_OXYGEN) {
+      map.set(INITIAL_OXYGEN.uid, INITIAL_OXYGEN);
+    }
+    oxygenDepots.forEach((o) => {
+      if (o && o.uid) map.set(o.uid, o);
+    });
+    users
+      .filter((u) => u.role === 'oxygenProvider' || (u.role as any) === 'oxygenDepot')
+      .forEach((u) => {
+        const existing = map.get(u.uid);
+        if (existing) {
+          if (u.displayName && (existing.providerName === INITIAL_OXYGEN.providerName || !existing.providerName)) {
+            existing.providerName = u.displayName;
+          }
+        } else {
+          const prof = dataStore.getOxygenProfile(u.uid);
+          if (prof) {
+            if (u.displayName) prof.providerName = u.displayName;
+            map.set(prof.uid, prof);
+          }
+        }
+      });
+    return Array.from(map.values());
+  }, [oxygenDepots, users]);
+
+  const allAmbulances = useMemo(() => {
+    const map = new Map<string, AmbulanceProfile>();
+    if (INITIAL_AMBULANCE) {
+      map.set(INITIAL_AMBULANCE.uid, INITIAL_AMBULANCE);
+    }
+    ambulances.forEach((a) => {
+      if (a && a.uid) map.set(a.uid, a);
+    });
+    users
+      .filter((u) => u.role === 'ambulanceProvider')
+      .forEach((u) => {
+        const existing = map.get(u.uid);
+        if (existing) {
+          if (u.displayName && (existing.providerName === INITIAL_AMBULANCE.providerName || !existing.providerName)) {
+            existing.providerName = u.displayName;
+          }
+        } else {
+          const prof = dataStore.getAmbulanceProfile(u.uid);
+          if (prof) {
+            if (u.displayName) prof.providerName = u.displayName;
+            map.set(prof.uid, prof);
+          }
+        }
+      });
+    return Array.from(map.values());
+  }, [ambulances, users]);
+
+  const handleVerify = async (uid: string, verify: boolean) => {
+    setSuccessMessage(null);
+    setErrorMessage(null);
+    setVerifyingUid(uid);
+    try {
+      await dataStore.verifyProvider(uid, verify);
+      setSuccessMessage(verify ? 'Provider organization verified successfully.' : 'Verification revoked.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      console.error('[CareBridge Admin] Provider verification update failed:', error);
+      setErrorMessage(error instanceof Error ? error.message : 'Provider verification could not be updated.');
+    } finally {
+      setVerifyingUid(null);
+    }
+  };
+
+  const handleStartAdjusting = (update: ProviderUpdateRequest) => {
+    setEditingUpdateId(update.id);
+    setAdjustedDetails({ ...(update.details || {}) });
+  };
+
+  const handleCancelAdjusting = () => {
+    setEditingUpdateId(null);
+    setAdjustedDetails({});
+  };
+
+  const handleApproveUpdateRequest = async (update: ProviderUpdateRequest) => {
+    setProcessingUpdateId(update.id);
+    setSuccessMessage(null);
+    setErrorMessage(null);
+    try {
+      const valuesToApply = editingUpdateId === update.id ? adjustedDetails : update.details;
+      const note = adminReviewNotes[update.id] || '';
+      await dataStore.approveProviderUpdateRequest(update.id, valuesToApply, note);
+      setEditingUpdateId(null);
+      setSuccessMessage(`Capacity update for ${update.providerName} APPROVED & applied live to network.`);
+      setTimeout(() => setSuccessMessage(null), 4000);
+      loadData();
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to approve update request.');
+    } finally {
+      setProcessingUpdateId(null);
+    }
+  };
+
+  const handleRejectUpdateRequest = async (update: ProviderUpdateRequest) => {
+    const reason = window.prompt(`Enter rejection reason for ${update.providerName}:`, 'Capacity verification unconfirmed');
+    if (reason === null) return;
+    setProcessingUpdateId(update.id);
+    setSuccessMessage(null);
+    setErrorMessage(null);
+    try {
+      await dataStore.rejectProviderUpdateRequest(update.id, reason || 'Declined by coordinator');
+      if (editingUpdateId === update.id) setEditingUpdateId(null);
+      setSuccessMessage(`Update request from ${update.providerName} DECLINED.`);
+      setTimeout(() => setSuccessMessage(null), 4000);
+      loadData();
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to decline update request.');
+    } finally {
+      setProcessingUpdateId(null);
+    }
+  };
+
+  const handleToggleActive = async (uid: string, currentActive: boolean) => {
+    setSuccessMessage(null);
+    setErrorMessage(null);
+    setVerifyingUid(uid);
+    try {
+      await dataStore.toggleUserActive(uid, !currentActive);
+      setSuccessMessage(!currentActive ? 'Account activated.' : 'Account suspended.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      console.error('[CareBridge Admin] Account status update failed:', error);
+      setErrorMessage(error instanceof Error ? error.message : 'Account status could not be updated.');
+    } finally {
+      setVerifyingUid(null);
+    }
+  };
+
+  // Open assignment modal for an emergency case
+  const handleOpenAssignment = (c: EmergencyCase) => {
+    setSelectedCase(c);
+    const caseReqs = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter(r => r.caseId === c.caseId);
+    const hospReq = caseReqs.find(r => ['bed', 'icu', 'hospital_admission'].includes(r.resourceType));
+    const ambReq = caseReqs.find(r => r.resourceType === 'ambulance');
+    const bloodReq = caseReqs.find(r => r.resourceType === 'blood');
+    const oxyReq = caseReqs.find(r => r.resourceType === 'oxygen');
+
+    setAssignHospitalId(c.assignedHospitalUid || (hospReq?.providerUid && hospReq.providerUid !== 'pending_coordinator_assignment' ? hospReq.providerUid : ''));
+    setAssignAmbulanceId(c.assignedAmbulanceUid || (ambReq?.providerUid && ambReq.providerUid !== 'pending_coordinator_assignment' ? ambReq.providerUid : ''));
+    setAssignBloodBankId(c.assignedBloodBankUid || (bloodReq?.providerUid && bloodReq.providerUid !== 'pending_coordinator_assignment' ? bloodReq.providerUid : ''));
+    setAssignOxygenId(c.assignedOxygenUid || (oxyReq?.providerUid && oxyReq.providerUid !== 'pending_coordinator_assignment' ? oxyReq.providerUid : ''));
+    setAssignNote(c.notes || '');
+    setErrorMessage(null);
+    setIsAssignModalOpen(true);
+  };
+
+  const handleCaseAssignmentSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCase) return;
+    if (!assignHospitalId && !assignAmbulanceId && !assignBloodBankId && !assignOxygenId) {
+      setErrorMessage('Please select at least one provider to assign.');
+      return;
+    }
+    setIsSubmittingAssignment(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      await dataStore.assignCaseProviders(selectedCase.caseId, {
+        hospitalUid: assignHospitalId || undefined,
+        ambulanceUid: assignAmbulanceId || undefined,
+        bloodBankUid: assignBloodBankId || undefined,
+        oxygenUid: assignOxygenId || undefined,
+        note: assignNote
+      });
+      setIsAssignModalOpen(false);
+      setSuccessMessage(`Providers successfully assigned to emergency ${selectedCase.caseId} and notified.`);
+      setTimeout(() => setSuccessMessage(null), 4000);
+      loadData();
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'The provider assignment failed.');
+    } finally {
+      setIsSubmittingAssignment(false);
+    }
+  };
+
+  const openRequestAssignment = (request: ResourceRequest) => {
+    setAssignmentRequest(request);
+    setSelectedAssignmentProviderUid('');
+    setAssignmentReason('');
+    setAssignmentHistory([]);
+    setAssignmentError(null);
+  };
+
+  useEffect(() => {
+    if (!assignmentRequest) return;
+    let active = true;
+    setIsLoadingAssignment(true);
+    const emergencyCase = coordinatorCases.find((item) => item.caseId === assignmentRequest.caseId);
+    void dataStore.getEligibleResourceProviders(assignmentRequest.resourceType, {
+      city: emergencyCase?.location?.city,
+      state: emergencyCase?.location?.state
+    }).then((providers) => {
+      if (active) setEligibleAssignmentProviders(providers);
+    }).catch((error) => {
+      if (active) setAssignmentError(error instanceof Error ? error.message : 'Could not load eligible providers.');
+    }).finally(() => {
+      if (active) setIsLoadingAssignment(false);
+    });
+
+    const unsubscribe = dataStore.subscribeToRequestAssignmentHistory(
+      assignmentRequest.requestId,
+      (history) => setAssignmentHistory(history),
+      (message) => setAssignmentError(message)
+    );
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [assignmentRequest, coordinatorCases]);
+
+  useEffect(() => {
+    if (!selectedCase) {
+      setLifecycleEvents([]);
+      return;
+    }
+    let active = true;
+    setLifecycleLoading(true);
+    setLifecycleError(null);
+    void dataStore.getEmergencyTimelineFromFirestore(selectedCase.caseId)
+      .then((events) => {
+        if (active) setLifecycleEvents(events);
+      })
+      .catch((error) => {
+        if (active) setLifecycleError(error instanceof Error ? error.message : 'Could not load the emergency timeline.');
+      })
+      .finally(() => {
+        if (active) setLifecycleLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedCase?.caseId, coordinatorRequests]);
+
+  useEffect(() => {
+    if (!selectedCase) return;
+    const latestCase = coordinatorCases.find((emergencyCase) => emergencyCase.caseId === selectedCase.caseId);
+    if (latestCase && latestCase.status !== selectedCase.status) {
+      setSelectedCase((current) => current && current.caseId === latestCase.caseId
+        ? { ...current, status: latestCase.status }
+        : current);
+    }
+  }, [coordinatorCases, selectedCase?.caseId, selectedCase?.status]);
+
+  const handleLifecycleTransition = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selectedCase || !nextLifecycleStatus) return;
+    setIsSavingLifecycleStatus(true);
+    setLifecycleError(null);
+    try {
+      await dataStore.transitionEmergencyCaseStatus(
+        selectedCase.caseId,
+        nextLifecycleStatus,
+        lifecycleReason
+      );
+      setSelectedCase((current) => current
+        ? { ...current, status: nextLifecycleStatus }
+        : current);
+      setNextLifecycleStatus('');
+      setLifecycleReason('');
+      setLifecycleEvents(await dataStore.getEmergencyTimelineFromFirestore(selectedCase.caseId));
+    } catch (error) {
+      setLifecycleError(error instanceof Error ? error.message : 'The emergency status could not be updated.');
+    } finally {
+      setIsSavingLifecycleStatus(false);
+    }
+  };
+
+  const handleConfirmAssignment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!assignmentRequest || !selectedAssignmentProviderUid) return;
+    setIsSavingAssignment(true);
+    setAssignmentError(null);
+    setSuccessMessage(null);
+    try {
+      await dataStore.assignResourceRequest(
+        assignmentRequest.requestId,
+        selectedAssignmentProviderUid,
+        assignmentReason
+      );
+      setAssignmentRequest(null);
+      setSuccessMessage(`Provider assigned to ${assignmentRequest.resourceType} request ${assignmentRequest.requestId}.`);
+      setTimeout(() => setSuccessMessage(null), 4000);
+    } catch (error) {
+      setAssignmentError(error instanceof Error ? error.message : 'The provider assignment failed.');
+    } finally {
+      setIsSavingAssignment(false);
+    }
+  };
+
+  // Filtered cases list
+  const filteredCases = cases.filter((c) => {
+    const matchesSearch =
+      (c.caseId || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (c.patientName || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (c.conditionSummary || c.patientCondition || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (c.location?.address || c.incidentAddress || '').toLowerCase().includes(searchQuery.toLowerCase());
+
+    const matchesStatus =
+      statusFilter === 'all' ||
+      (statusFilter === 'active' && c.status !== 'COMPLETED' && c.status !== 'resolved' && c.status !== 'cancelled') ||
+      c.status === statusFilter ||
+      (statusFilter === 'REQUESTED' && (c.status === 'Submitted' || String(c.status).toLowerCase() === 'pending'));
+
+    const matchesPriority =
+      priorityFilter === 'all' ||
+      c.priority === priorityFilter ||
+      (priorityFilter === 'Critical' && c.urgencyLevel === 'immediate');
+
+    return matchesSearch && matchesStatus && matchesPriority;
+  });
+
+  const pendingVerificationProviders = users.filter(
+    (u) => ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider', 'doctor'].includes(u.role) && !u.isVerified
+  );
+
+  const filteredUsers = users.filter((u) => {
+    const matchesSearch =
+      u.displayName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      u.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      u.city.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesRole = userRoleFilter === 'all' || u.role === userRoleFilter;
+    return matchesSearch && matchesRole;
+  });
+
+  const activeCasesCount = cases.filter(
+    (c) => c.status !== 'COMPLETED' && c.status !== 'resolved' && c.status !== 'cancelled'
+  ).length;
+
+  const pendingRequestsCount = requests.filter(
+    (r) => r.status === 'pending' || r.status === 'ASSIGNED' || r.status === 'REQUESTED'
+  ).length;
+
+  const coordinatorFilteredCases = coordinatorCases.filter((emergencyCase) => {
+    const matchesPriority = coordinatorPriorityFilter === 'all' ||
+      (emergencyCase.priority || emergencyCase.urgencyLevel) === coordinatorPriorityFilter;
+    const matchesStatus = coordinatorStatusFilter === 'all' || emergencyCase.status === coordinatorStatusFilter;
+    const createdDate = (emergencyCase.createdAt || '').slice(0, 10);
+    const matchesFrom = !dateFromFilter || createdDate >= dateFromFilter;
+    const matchesTo = !dateToFilter || createdDate <= dateToFilter;
+    const matchesResource = resourceFilter === 'all' || coordinatorRequests.some((request) =>
+      request.caseId === emergencyCase.caseId &&
+      resourceGroups.find((group) => group.id === resourceFilter)?.resourceTypes.includes(request.resourceType)
+    );
+    return matchesPriority && matchesStatus && matchesFrom && matchesTo && matchesResource;
+  });
+  const providerCount = users.filter((u) =>
+    ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider'].includes(u.role)
+  ).length;
+
+  const getPriorityBadge = (p?: EmergencyPriority, u?: string) => {
+    if (p === 'Critical' || u === 'immediate') {
+      return (
+        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-red-100 text-red-800 border border-red-200">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-600 animate-pulse" />
+          Critical (P1)
+        </span>
+      );
+    }
+    if (p === 'High' || u === 'emergency') {
+      return (
+        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
+          High (P2)
+        </span>
+      );
+    }
+    if (p === 'Medium' || u === 'urgent') {
+      return (
+        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-yellow-100 text-yellow-800 border border-yellow-200">
+          Medium (P3)
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+        Low (P4)
+      </span>
+    );
+  };
+
+  const getStatusBadge = (status: CaseStatus) => {
+    switch (status) {
+      case 'REQUESTED':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-blue-100 text-blue-800 border border-blue-200">REQUESTED</span>;
+      case 'UNDER_REVIEW':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-purple-100 text-purple-800 border border-purple-200">UNDER REVIEW</span>;
+      case 'ASSIGNED':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-200">ASSIGNED</span>;
+      case 'ACCEPTED':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-teal-100 text-teal-800 border border-teal-200">ACCEPTED</span>;
+      case 'RESOURCE_CONFIRMED':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-cyan-100 text-cyan-800 border border-cyan-200">RESOURCE CONFIRMED</span>;
+      case 'DISPATCHED':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">DISPATCHED</span>;
+      case 'IN_PROGRESS':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-sky-100 text-sky-800 border border-sky-200">IN PROGRESS</span>;
+      case 'COMPLETED':
+      case 'resolved':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">COMPLETED</span>;
+      case 'REJECTED':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-rose-100 text-rose-800 border border-rose-200">REJECTED</span>;
+      case 'cancelled':
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-slate-200 text-slate-700">CANCELLED</span>;
+      default:
+        return <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-slate-100 text-slate-800">ACTIVE</span>;
+    }
+  };
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+      {/* Top Banner */}
+      <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="flex items-start gap-4">
+          <div className="w-14 h-14 rounded-2xl bg-purple-50 border border-purple-100 flex items-center justify-center shrink-0 text-purple-600 shadow-xs">
+            <Shield className="w-8 h-8" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-xl sm:text-2xl font-bold text-slate-900">CareBridge Central Coordinator Command</h1>
+              <span className="text-[11px] font-semibold bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full font-mono">
+                Hubballi Regional Control
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 mt-1 max-w-2xl">
+              Real-time incoming emergency triage, automated & manual provider dispatch, bed capacity telemetry, and full lifecycle tracking.
+            </p>
+          </div>
+        </div>
+
+        <button
+          onClick={() => {
+            loadData();
+            setCoordinatorRefresh((value) => value + 1);
+          }}
+          className="p-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 self-end sm:self-auto"
+        >
+          <RefreshCw className="w-4 h-4" />
+        </button>
+      </div>
+
+      {successMessage && (
+        <div className="p-3.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold rounded-xl flex items-center gap-2 shadow-xs">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span>{successMessage}</span>
+        </div>
+      )}
+      {errorMessage && (
+        <div role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs font-semibold rounded-xl flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-600" />
+          {errorMessage}
+        </div>
+      )}
+
+      {/* KPI Stats Grid */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div className="p-4 bg-white rounded-2xl border border-slate-200 shadow-xs">
+          <div className="text-slate-500 text-xs font-medium">Active Emergencies</div>
+          <div className="text-2xl font-black text-red-600 mt-1">{activeCasesCount}</div>
+          <div className="text-[11px] text-red-500 mt-0.5">Live emergency cases requiring coordination</div>
+        </div>
+        <div className="p-4 bg-white rounded-2xl border border-slate-200 shadow-xs">
+          <div className="text-slate-500 text-xs font-medium">Pending Provider Requisitions</div>
+          <div className="text-2xl font-black text-amber-600 mt-1">{pendingRequestsCount}</div>
+          <div className="text-[11px] text-amber-600 mt-0.5">Awaiting provider acceptance</div>
+        </div>
+        <div className="p-4 bg-white rounded-2xl border border-slate-200 shadow-xs">
+          <div className="text-slate-500 text-xs font-medium">Verified Facilities & Fleet</div>
+          <div className="text-2xl font-black text-teal-600 mt-1">{providerCount}</div>
+          <div className="text-[11px] text-teal-600 mt-0.5">Hospitals, Blood, Oxygen, Ambulances</div>
+        </div>
+        <div className="p-4 bg-white rounded-2xl border border-slate-200 shadow-xs">
+          <div className="text-slate-500 text-xs font-medium">Total Registered Users</div>
+          <div className="text-2xl font-black text-slate-900 mt-1">{users.length}</div>
+          <div className="text-[11px] text-slate-400 mt-0.5">Authenticated stakeholders</div>
+        </div>
+      </div>
+
+      {activeTab === 'coordinator' && (
+      <section className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+        <div className="flex flex-col gap-1 border-b border-slate-100 pb-3">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <Activity className="w-5 h-5 text-red-600" /> Central Emergency Coordination
+          </h2>
+          <p className="text-xs text-slate-500">Live emergency cases and linked resource requests from Firestore.</p>
+        </div>
+
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+          <select aria-label="Filter by priority" value={coordinatorPriorityFilter} onChange={(event) => setCoordinatorPriorityFilter(event.target.value)} className="text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <option value="all">All priorities</option>
+            {Array.from(new Set(coordinatorCases.map((record) => record.priority || record.urgencyLevel))).filter(Boolean).map((priority) => (
+              <option key={priority} value={priority}>{priority}</option>
+            ))}
+          </select>
+          <select aria-label="Filter by emergency status" value={coordinatorStatusFilter} onChange={(event) => setCoordinatorStatusFilter(event.target.value)} className="text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <option value="all">All statuses</option>
+            {Array.from(new Set(coordinatorCases.map((record) => record.status))).filter(Boolean).map((status) => (
+              <option key={status} value={status}>{status}</option>
+            ))}
+          </select>
+          <select aria-label="Filter by resource type" value={resourceFilter} onChange={(event) => setResourceFilter(event.target.value as CoordinatorResourceFilter)} className="text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <option value="all">All resource types</option>
+            {resourceGroups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
+          </select>
+          <label className="text-[11px] text-slate-500">
+            From
+            <input aria-label="Filter emergencies from date" type="date" value={dateFromFilter} onChange={(event) => setDateFromFilter(event.target.value)} className="block w-full text-xs p-1.5 bg-slate-50 border border-slate-200 rounded-lg" />
+          </label>
+          <label className="text-[11px] text-slate-500">
+            To
+            <input aria-label="Filter emergencies through date" type="date" value={dateToFilter} onChange={(event) => setDateToFilter(event.target.value)} className="block w-full text-xs p-1.5 bg-slate-50 border border-slate-200 rounded-lg" />
+          </label>
+        </div>
+
+        {coordinatorError && (
+          <div role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs rounded-xl flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" /> {coordinatorError}
+          </div>
+        )}
+        {coordinatorLoading ? (
+          <div className="py-8 text-center text-slate-500 text-sm">Loading Firestore emergency data...</div>
+        ) : !coordinatorError && coordinatorFilteredCases.length === 0 ? (
+          <div className="py-8 text-center text-slate-400 text-sm">
+            {coordinatorCases.length === 0 ? 'No emergency cases are currently available.' : 'No cases match the selected filters.'}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {coordinatorFilteredCases.map((emergencyCase) => {
+              const caseRequests = coordinatorRequests.filter((request) => request.caseId === emergencyCase.caseId);
+              const groups = resourceFilter === 'all'
+                ? resourceGroups
+                : resourceGroups.filter((group) => group.id === resourceFilter);
+              return (
+                <article key={emergencyCase.caseId} className="rounded-xl border border-slate-200 overflow-hidden">
+                  <div className="p-4 bg-slate-50/70 grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Emergency ID</div>
+                      <div className="text-xs font-bold font-mono text-slate-900">{emergencyCase.caseId}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Patient</div>
+                      <div className="text-xs font-semibold text-slate-900">{emergencyCase.patientName || 'Patient details unavailable'}</div>
+                      <div className="text-[11px] text-slate-500">
+                        {[emergencyCase.patientAge && `${emergencyCase.patientAge} years`, emergencyCase.patientGender].filter(Boolean).join(' · ') || 'Details unavailable'}
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-mono">{emergencyCase.patientUid}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Category / Priority</div>
+                      <div className="text-xs font-semibold text-slate-800">{emergencyCase.category || emergencyCase.conditionSummary || 'Unspecified'} · {emergencyCase.priority || emergencyCase.urgencyLevel || 'Unspecified'}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Status / Created</div>
+                      <div className="text-xs font-semibold capitalize text-slate-800">{emergencyCase.status}</div>
+                      <div className="text-[11px] text-slate-500">{formatDate(emergencyCase.createdAt)}</div>
+                    </div>
+                    <div className="sm:col-span-2 lg:col-span-4 flex items-start gap-1.5 text-xs text-slate-600">
+                      <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-0.5" />
+                      {emergencyCase.location?.address || emergencyCase.location?.city || 'Location unavailable'}
+                    </div>
+                    <div className="sm:col-span-2 lg:col-span-4 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedCaseId((current) => current === emergencyCase.caseId ? null : emergencyCase.caseId)}
+                        aria-expanded={expandedCaseId === emergencyCase.caseId}
+                        className="text-xs font-semibold text-purple-700 hover:text-purple-900"
+                      >
+                        {expandedCaseId === emergencyCase.caseId ? 'Hide emergency details' : 'Open emergency details'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {expandedCaseId === emergencyCase.caseId && (
+                    <div className="px-4 py-3 bg-purple-50/50 border-t border-purple-100 grid sm:grid-cols-2 gap-3 text-xs">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-slate-400">Emergency description</div>
+                        <p className="text-slate-700 mt-1">{emergencyCase.conditionSummary || 'No description provided.'}</p>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-slate-400">Resources requested</div>
+                        <p className="text-slate-700 mt-1">{emergencyCase.resourcesNeeded?.join(', ') || 'None specified'}</p>
+                      </div>
+                      {emergencyCase.attendant && (
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wide text-slate-400">Attendant</div>
+                          <p className="text-slate-700 mt-1">{emergencyCase.attendant.name} ({emergencyCase.attendant.relation}) · {emergencyCase.attendant.phone}</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="p-4 space-y-3">
+                    <h3 className="text-xs font-bold uppercase tracking-wide text-slate-600">Resource requests</h3>
+                    {groups.map((group) => {
+                      const groupRequests = caseRequests.filter((request) => group.resourceTypes.includes(request.resourceType));
+                      return (
+                        <div key={group.id} className="rounded-lg border border-slate-100">
+                          <div className="px-3 py-2 bg-slate-50 text-xs font-bold text-slate-700">
+                            {group.label} <span className="text-slate-400 font-medium">({groupRequests.length})</span>
+                          </div>
+                          {groupRequests.length === 0 ? (
+                            <div className="px-3 py-2 text-[11px] text-slate-400">No {group.label.toLowerCase()} request for this case.</div>
+                          ) : (
+                            <div className="divide-y divide-slate-100">
+                              {groupRequests.map((request) => (
+                                <div key={request.requestId} className="px-3 py-2 grid sm:grid-cols-5 gap-2 text-[11px] items-center">
+                                  <div><span className="text-slate-400">Provider: </span><span className="font-semibold text-slate-700">{request.providerName || request.providerUid || 'Unassigned'}</span></div>
+                                  <div><span className="text-slate-400">Type: </span><span className="text-slate-700 capitalize">{request.resourceType}</span></div>
+                                  <div><span className="text-slate-400">Status: </span>
+                                    {String(request.status).toLowerCase() === 'accepted' ? (
+                                      <span className="font-bold text-emerald-700">Accepted</span>
+                                    ) : String(request.status).toLowerCase() === 'rejected' ? (
+                                      <span className="font-bold text-red-700" title={request.rejectionReason}>
+                                        Declined {request.rejectionReason ? `(${request.rejectionReason})` : ''}
+                                      </span>
+                                    ) : String(request.status).toLowerCase() === 'assigned' ? (
+                                      <span className="font-semibold text-amber-800">Assigned (Awaiting Response)</span>
+                                    ) : (
+                                      <span className="text-slate-700 capitalize">{request.status}</span>
+                                    )}
+                                  </div>
+                                  <div><span className="text-slate-400">Updated: </span><span className="text-slate-700">{request.updatedAt ? formatDate(request.updatedAt) : 'Not recorded'}</span></div>
+                                  {currentUser?.role === 'admin' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => openRequestAssignment(request)}
+                                      className="justify-self-start rounded-lg border border-purple-200 bg-purple-50 px-2.5 py-1.5 text-[10px] font-bold text-purple-800 hover:bg-purple-100"
+                                    >
+                                      {request.status !== 'REQUESTED' && request.providerUid ? 'Reassign' : 'Assign provider'}
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      )}
+      {/* Dashboard Navigation Tabs */}
+      <div className="flex items-center gap-2 border-b border-slate-200 pb-2 overflow-x-auto">
+        <button
+          onClick={() => setActiveTab('emergencies')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'emergencies'
+              ? 'bg-[#00707E] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Activity className="w-4 h-4" />
+          <span>Live Emergency Coordination ({filteredCases.length})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('providers')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'providers'
+              ? 'bg-[#00707E] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Building2 className="w-4 h-4" />
+          <span>Provider Capacities & Verification ({pendingVerificationProviders.length + providerUpdates.filter((u) => !u.status || u.status === 'PENDING').length})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('users')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'users'
+              ? 'bg-[#00707E] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Users className="w-4 h-4" />
+          <span>User Access Control</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('coordinator')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 whitespace-nowrap ${
+            activeTab === 'coordinator'
+              ? 'bg-[#00707E] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Activity className="w-4 h-4" />
+          <span>Central Coordinator</span>
+        </button>
+      </div>
+
+      {/* TAB 1: LIVE EMERGENCY COORDINATION */}
+      {activeTab === 'emergencies' && (
+        <div className="space-y-4">
+          {/* Controls: Search, Status Filter, Priority Filter */}
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 flex-1 min-w-[240px]">
+              <Search className="w-4 h-4 text-slate-400 shrink-0" />
+              <input
+                type="text"
+                placeholder="Search emergency by ID, patient, condition, or address..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#00707E]"
+              />
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-1 text-xs text-slate-500">
+                <Filter className="w-3.5 h-3.5" />
+                <span>Status:</span>
+              </div>
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                className="text-xs px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-medium"
+              >
+                <option value="all">All Statuses</option>
+                <option value="active">Active Only</option>
+                <option value="REQUESTED">REQUESTED</option>
+                <option value="UNDER_REVIEW">UNDER REVIEW</option>
+                <option value="ASSIGNED">ASSIGNED</option>
+                <option value="ACCEPTED">ACCEPTED</option>
+                <option value="RESOURCE_CONFIRMED">RESOURCE CONFIRMED</option>
+                <option value="DISPATCHED">DISPATCHED</option>
+                <option value="IN_PROGRESS">IN PROGRESS</option>
+                <option value="COMPLETED">COMPLETED</option>
+                <option value="REJECTED">REJECTED</option>
+              </select>
+
+              <div className="flex items-center gap-1 text-xs text-slate-500 ml-2">
+                <span>Priority:</span>
+              </div>
+              <select
+                value={priorityFilter}
+                onChange={(e) => setPriorityFilter(e.target.value)}
+                className="text-xs px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-medium"
+              >
+                <option value="all">All Priorities</option>
+                <option value="Critical">Critical (P1)</option>
+                <option value="High">High (P2)</option>
+                <option value="Medium">Medium (P3)</option>
+                <option value="Low">Low (P4)</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Emergency Cases List */}
+          {filteredCases.length === 0 ? (
+            <div className="bg-white rounded-2xl p-12 text-center border border-slate-200 shadow-xs">
+              <Activity className="w-10 h-10 text-slate-300 mx-auto mb-2" />
+              <div className="font-bold text-slate-700">No emergency requests found</div>
+              <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+                No active or historical emergency requests match the current search filters.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredCases.map((c) => (
+                <div
+                  key={c.caseId}
+                  className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs hover:border-slate-300 transition-all flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                >
+                  <div className="space-y-2 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono font-bold text-sm text-slate-900 bg-slate-100 px-2.5 py-0.5 rounded-md">
+                        {c.caseId}
+                      </span>
+                      {getPriorityBadge(c.priority, c.urgencyLevel)}
+                      {getStatusBadge(c.status)}
+                      {c.category && (
+                        <span className="text-[11px] font-semibold text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+                          {c.category}
+                        </span>
+                      )}
+                      <span className="text-xs text-slate-400 flex items-center gap-1 ml-auto lg:ml-0">
+                        <Clock className="w-3.5 h-3.5" />
+                        {(() => {
+                          const d = new Date(c.createdAt);
+                          if (Number.isNaN(d.getTime())) return c.createdAt || c.dateStr || 'Just now';
+                          return `${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • ${d.toLocaleDateString()}`;
+                        })()}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-700">
+                      <div>
+                        <span className="font-semibold text-slate-900">{c.patientName}</span>
+                        <span className="text-slate-400"> ({c.patientAge}y, {c.patientGender}, {c.patientBloodGroup || 'Blood Unknown'})</span>
+                      </div>
+                      <div className="text-slate-400">•</div>
+                      <div className="flex items-center gap-1 text-slate-600">
+                        <MapPin className="w-3.5 h-3.5 text-red-500" />
+                        <span>{c.location?.address || 'Hubballi'}</span>
+                      </div>
+                      {c.attendant && (
+                        <>
+                          <div className="text-slate-400">•</div>
+                          <div className="text-slate-600">
+                            Attendant: <span className="font-medium text-slate-800">{c.attendant.name}</span> ({c.attendant.phone})
+                          </div>
+                        </>
+                      )}
+                    </div>
+
+                    <div className="text-xs text-slate-600 bg-slate-50/70 p-2 rounded-xl border border-slate-100">
+                      <span className="font-semibold text-slate-800">Complaint:</span> {c.conditionSummary}
+                    </div>
+
+                    {/* Assigned Providers Summary & Live Response Status */}
+                    {(() => {
+                      const caseReqs = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter((r) => r.caseId === c.caseId);
+                      const hospReq = caseReqs.find((r) => ['bed', 'icu', 'hospital_admission'].includes(r.resourceType));
+                      const ambReq = caseReqs.find((r) => r.resourceType === 'ambulance');
+                      const bloodReq = caseReqs.find((r) => r.resourceType === 'blood');
+                      const oxyReq = caseReqs.find((r) => r.resourceType === 'oxygen');
+
+                      const hospName = c.assignedHospitalName || hospReq?.providerName;
+                      const ambName = c.assignedAmbulanceName || ambReq?.providerName;
+                      const bloodName = c.assignedBloodBankName || bloodReq?.providerName;
+                      const oxyName = c.assignedOxygenName || oxyReq?.providerName;
+
+                      const getProviderStatusBadge = (name?: string, req?: ResourceRequest) => {
+                        if (!name && !req?.providerUid) {
+                          return <span className="bg-slate-100 text-slate-400 px-2 py-0.5 rounded font-medium">Not Assigned</span>;
+                        }
+                        const statusStr = String(req?.status || (c.status === 'ASSIGNED' ? 'ASSIGNED' : '')).toLowerCase();
+                        if (statusStr === 'accepted') {
+                          return (
+                            <span className="bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded font-semibold inline-flex items-center gap-1">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-600" /> {name || req?.providerName} (Accepted)
+                            </span>
+                          );
+                        }
+                        if (statusStr === 'rejected') {
+                          return (
+                            <span className="bg-red-50 text-red-800 border border-red-200 px-2 py-0.5 rounded font-bold inline-flex items-center gap-1" title={req?.rejectionReason}>
+                              <XCircle className="w-3 h-3 text-red-600" /> {name || req?.providerName} (Declined{req?.rejectionReason ? `: ${req.rejectionReason}` : ''})
+                            </span>
+                          );
+                        }
+                        return (
+                          <span className="bg-amber-50 text-amber-900 border border-amber-200 px-2 py-0.5 rounded font-medium inline-flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-amber-600" /> {name || req?.providerName} (Awaiting Response)
+                          </span>
+                        );
+                      };
+
+                      const hasAnyRejection = [hospReq, ambReq, bloodReq, oxyReq].some(
+                        (r) => r && String(r.status).toLowerCase() === 'rejected'
+                      );
+
+                      return (
+                        <div className="space-y-1.5 pt-1">
+                          {hasAnyRejection && (
+                            <div className="flex items-center gap-1.5 text-xs font-bold text-red-700 bg-red-50 border border-red-200 px-2.5 py-1 rounded-lg">
+                              <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-red-600" />
+                              <span>Provider declined request — immediate coordinator reassignment required!</span>
+                            </div>
+                          )}
+                          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                            <span className="text-slate-400 font-semibold uppercase text-[10px]">Providers:</span>
+                            <div className="flex items-center gap-1">
+                              <span className="text-slate-500 font-semibold">Hosp:</span>
+                              {getProviderStatusBadge(hospName, hospReq)}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <span className="text-slate-500 font-semibold">Amb:</span>
+                              {getProviderStatusBadge(ambName, ambReq)}
+                            </div>
+                            {(c.resourcesNeeded || []).some((r) => r.toLowerCase().includes('blood')) && (
+                              <div className="flex items-center gap-1">
+                                <span className="text-slate-500 font-semibold">Blood:</span>
+                                {getProviderStatusBadge(bloodName, bloodReq)}
+                              </div>
+                            )}
+                            {(c.resourcesNeeded || []).some((r) => r.toLowerCase().includes('oxygen')) && (
+                              <div className="flex items-center gap-1">
+                                <span className="text-slate-500 font-semibold">Oxy:</span>
+                                {getProviderStatusBadge(oxyName, oxyReq)}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Action Buttons */}
+                  <div className="flex sm:flex-col items-center justify-end gap-2 shrink-0 border-t sm:border-t-0 sm:border-l border-slate-100 pt-3 sm:pt-0 sm:pl-4">
+                    <button
+                      onClick={() => handleOpenAssignment(c)}
+                      className="w-full px-3.5 py-2 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white text-xs font-bold shadow-xs transition-colors flex items-center justify-center gap-1.5"
+                    >
+                      <Sliders className="w-3.5 h-3.5" />
+                      <span>{c.assignedHospitalUid || c.status === 'ASSIGNED' ? 'Reassign Providers' : 'Assign Providers'}</span>
+                    </button>
+
+                    <button
+                      onClick={() => setSelectedCase(c)}
+                      className="w-full px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      <span>Audit Trail</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: PROVIDER CAPACITIES & VERIFICATION */}
+      {activeTab === 'providers' && (
+        <div className="space-y-6">
+          {/* Live Provider Data Updates & Requests Queue */}
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-100 pb-3 gap-2">
+              <div>
+                <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-indigo-600 animate-pulse" /> Live Provider Capacity Updates & Approval Queue
+                  {providerUpdates.filter((u) => !u.status || u.status === 'PENDING').length > 0 && (
+                    <span className="bg-amber-500 text-white text-xs font-bold px-2.5 py-0.5 rounded-full animate-bounce">
+                      {providerUpdates.filter((u) => !u.status || u.status === 'PENDING').length} Pending Coordinator Approval
+                    </span>
+                  )}
+                  {providerUpdates.length > 0 && (
+                    <span className="bg-slate-100 text-slate-700 text-xs font-semibold px-2 py-0.5 rounded-full border border-slate-200">
+                      {providerUpdates.length} Total Requests
+                    </span>
+                  )}
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Real-time inventory and capacity changes transmitted by healthcare providers. Review, adjust values as needed, and approve to broadcast live into the network.
+                </p>
+              </div>
+            </div>
+
+            {providerUpdates.length === 0 ? (
+              <div className="py-6 text-center text-slate-400 text-xs">
+                <Clock className="w-8 h-8 text-slate-300 mx-auto mb-1 opacity-70" />
+                No provider capacity update requests received recently. Live updates will display here automatically.
+              </div>
+            ) : (
+              <div className="space-y-3.5 max-h-[480px] overflow-y-auto pr-1">
+                {providerUpdates.map((update) => {
+                  const isPending = !update.status || update.status === 'PENDING';
+                  const isApproved = update.status === 'APPROVED';
+                  const isRejected = update.status === 'REJECTED';
+                  const isEditing = editingUpdateId === update.id;
+                  const isBusy = processingUpdateId === update.id;
+
+                  return (
+                    <div
+                      key={update.id}
+                      className={`p-4 rounded-2xl border transition-all ${
+                        isPending
+                          ? 'border-amber-200 bg-amber-50/40 shadow-xs'
+                          : isApproved
+                          ? 'border-emerald-200 bg-emerald-50/20'
+                          : 'border-slate-200 bg-slate-50/50'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-bold text-sm text-slate-900">{update.providerName}</span>
+                            <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800">
+                              {update.providerRole}
+                            </span>
+                            <span className="text-[10px] text-slate-400 font-mono">
+                              {new Date(update.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </span>
+                          </div>
+
+                          <div className="text-xs text-slate-700 font-medium">
+                            <span className="text-slate-500 font-normal">Requested Inventory / Capacity: </span>
+                            <span className="font-semibold text-slate-900">{update.summary}</span>
+                          </div>
+
+                          {update.adminNote && (
+                            <p className="text-[11px] text-slate-500 italic">
+                              Coordinator Note: "{update.adminNote}"
+                            </p>
+                          )}
+                        </div>
+
+                        {/* Status Badges */}
+                        <div className="shrink-0">
+                          {isPending && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-800 bg-amber-100 border border-amber-300 px-2.5 py-1 rounded-full shadow-xs">
+                              <Clock className="w-3.5 h-3.5" /> Awaiting Coordinator Review
+                            </span>
+                          )}
+                          {isApproved && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 px-2.5 py-1 rounded-full">
+                              <CheckCircle className="w-3.5 h-3.5 text-emerald-600" /> Approved & Synced Live
+                            </span>
+                          )}
+                          {isRejected && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-bold text-rose-800 bg-rose-100 border border-rose-300 px-2.5 py-1 rounded-full">
+                              <XCircle className="w-3.5 h-3.5 text-rose-600" /> Declined
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Inline Adjustments Section (when admin changes the values before approving) */}
+                      {isPending && isEditing && (
+                        <div className="mt-3 p-3 bg-white rounded-xl border border-amber-200 space-y-3 animate-in fade-in duration-150">
+                          <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                            <Edit2 className="w-3.5 h-3.5 text-amber-600" />
+                            <span>Adjust Capacity Values Before Approving</span>
+                          </div>
+
+                          {/* Oxygen Adjustments */}
+                          {update.providerRole === 'oxygenProvider' && (
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">Cylinders Available</label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={adjustedDetails.cylindersAvailable ?? update.details?.cylindersAvailable ?? 0}
+                                  onChange={(e) => setAdjustedDetails((prev) => ({ ...prev, cylindersAvailable: Number(e.target.value) }))}
+                                  className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg font-bold"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">Concentrators Available</label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={adjustedDetails.concentratorsAvailable ?? update.details?.concentratorsAvailable ?? 0}
+                                  onChange={(e) => setAdjustedDetails((prev) => ({ ...prev, concentratorsAvailable: Number(e.target.value) }))}
+                                  className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg font-bold"
+                                />
+                              </div>
+                              <div className="flex items-center pt-4">
+                                <label className="flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(adjustedDetails.deliveryAvailable ?? update.details?.deliveryAvailable)}
+                                    onChange={(e) => setAdjustedDetails((prev) => ({ ...prev, deliveryAvailable: e.target.checked }))}
+                                    className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                  />
+                                  <span>Delivery Fleet Available</span>
+                                </label>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Hospital Adjustments */}
+                          {update.providerRole === 'hospital' && (
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">Available Beds</label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={adjustedDetails.availableBeds ?? update.details?.availableBeds ?? 0}
+                                  onChange={(e) => setAdjustedDetails((prev) => ({ ...prev, availableBeds: Number(e.target.value) }))}
+                                  className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg font-bold"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">Available ICU</label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={adjustedDetails.availableICU ?? update.details?.availableICU ?? 0}
+                                  onChange={(e) => setAdjustedDetails((prev) => ({ ...prev, availableICU: Number(e.target.value) }))}
+                                  className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg font-bold"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">Ventilators</label>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  value={adjustedDetails.availableVentilators ?? update.details?.availableVentilators ?? 0}
+                                  onChange={(e) => setAdjustedDetails((prev) => ({ ...prev, availableVentilators: Number(e.target.value) }))}
+                                  className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg font-bold"
+                                />
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Blood Bank Adjustments */}
+                          {update.providerRole === 'bloodBank' && update.details?.inventory && (
+                            <div>
+                              <label className="block text-[11px] font-semibold text-slate-600 mb-1">Blood Units Inventory</label>
+                              <div className="grid grid-cols-4 sm:grid-cols-8 gap-1.5">
+                                {Object.keys(update.details.inventory).map((group) => (
+                                  <div key={group} className="text-center">
+                                    <div className="text-[10px] font-bold text-slate-600">{group}</div>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      value={adjustedDetails.inventory?.[group] ?? update.details.inventory[group] ?? 0}
+                                      onChange={(e) => {
+                                        const newInv = { ...(adjustedDetails.inventory || update.details.inventory), [group]: Number(e.target.value) };
+                                        setAdjustedDetails((prev) => ({ ...prev, inventory: newInv }));
+                                      }}
+                                      className="w-full text-xs p-1 text-center bg-slate-50 border border-slate-200 rounded font-bold"
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Coordinator Note Field */}
+                          <div>
+                            <input
+                              type="text"
+                              placeholder="Coordinator note (e.g. Verified via depot phone check)..."
+                              value={adminReviewNotes[update.id] || ''}
+                              onChange={(e) => setAdminReviewNotes((prev) => ({ ...prev, [update.id]: e.target.value }))}
+                              className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                            />
+                          </div>
+
+                          <div className="flex items-center justify-end gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={handleCancelAdjusting}
+                              className="px-3 py-1 text-xs text-slate-600 hover:bg-slate-100 rounded-lg"
+                            >
+                              Cancel Adjustments
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Action Controls for Pending Updates */}
+                      {isPending && (
+                        <div className="mt-3 pt-3 border-t border-amber-200/60 flex flex-wrap items-center justify-end gap-2">
+                          {!isEditing && (
+                            <button
+                              type="button"
+                              onClick={() => handleStartAdjusting(update)}
+                              className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                            >
+                              <Edit2 className="w-3 h-3 text-slate-500" />
+                              <span>Adjust Numbers</span>
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => handleRejectUpdateRequest(update)}
+                            disabled={isBusy}
+                            className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold flex items-center gap-1.5 transition-colors"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>Decline Request</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleApproveUpdateRequest(update)}
+                            disabled={isBusy}
+                            className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>{isBusy ? 'Processing...' : isEditing ? '✓ Approve With Adjusted Values' : '✓ Approve & Broadcast Live'}</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Pending Verification Banner */}
+          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Shield className="w-5 h-5 text-purple-600" /> Healthcare Provider Verification Queue
+                  {pendingVerificationProviders.length > 0 && (
+                    <span className="bg-amber-500 text-white text-xs font-bold px-2 py-0.5 rounded-full">
+                      {pendingVerificationProviders.length} Pending Approval
+                    </span>
+                  )}
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Hospitals, blood banks, oxygen depots, and ambulance fleets require coordinator approval prior to accepting emergency dispatches.
+                </p>
+              </div>
+            </div>
+
+            {pendingVerificationProviders.length === 0 ? (
+              <div className="py-6 text-center text-slate-400 text-xs">
+                <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-1 opacity-70" />
+                All active registered healthcare providers have been authenticated and verified.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {pendingVerificationProviders.map((prov) => (
+                  <div
+                    key={prov.uid}
+                    className="p-4 rounded-xl border border-amber-200 bg-amber-50/30 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-sm text-slate-900">{prov.displayName}</span>
+                        <span className="text-[11px] uppercase font-bold px-2 py-0.5 rounded bg-slate-200 text-slate-800">
+                          {prov.role}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 mt-1">
+                        <span>Email: {prov.email}</span>
+                        <span>City: {prov.city}, {prov.state}</span>
+                        <span>Phone: {prov.phone || 'N/A'}</span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleVerify(prov.uid, false)}
+                        className="px-3.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 rounded-lg border border-red-200"
+                      >
+                        Reject
+                      </button>
+                      <button
+                        onClick={() => handleVerify(prov.uid, true)}
+                        className="px-4 py-1.5 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 rounded-lg shadow-xs flex items-center gap-1.5"
+                      >
+                        <Check className="w-3.5 h-3.5" /> Approve & Verify
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Real-Time Live Capacities Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Hospitals Telemetry */}
+            <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs space-y-3">
+              <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                <Bed className="w-4 h-4 text-blue-600" />
+                <span>Hospital Bed & ICU Telemetry</span>
+              </h3>
+              <div className="space-y-2">
+                {allHospitals.map((h) => (
+                  <div key={h.uid} className="p-3 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-between">
+                    <div>
+                      <div className="font-bold text-xs text-slate-900">{h.hospitalName}</div>
+                      <div className="text-[11px] text-slate-500">{h.address || h.city}</div>
+                    </div>
+                    <div className="flex items-center gap-3 text-right">
+                      <div>
+                        <div className="text-xs font-black text-blue-600">{h.availableBeds} / {h.totalBeds}</div>
+                        <div className="text-[10px] text-slate-400">Gen Beds</div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-black text-purple-600">{h.availableICU} / {h.totalICU}</div>
+                        <div className="text-[10px] text-slate-400">ICU Beds</div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Blood Bank Telemetry */}
+            <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs space-y-3">
+              <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                <Droplet className="w-4 h-4 text-rose-600" />
+                <span>Blood Bank Inventory Telemetry</span>
+              </h3>
+              <div className="space-y-2">
+                {allBloodBanks.map((b) => (
+                  <div key={b.uid} className="p-3 rounded-xl bg-slate-50 border border-slate-100 space-y-2">
+                    <div className="font-bold text-xs text-slate-900">{b.bankName}</div>
+                    <div className="grid grid-cols-4 gap-1.5 text-center">
+                      {Object.entries(b.inventory || {}).map(([grp, units]) => (
+                        <div key={grp} className="bg-white p-1 rounded border border-slate-200">
+                          <span className="text-[10px] font-bold text-slate-500">{grp}</span>
+                          <div className={`text-xs font-extrabold ${Number(units) < 5 ? 'text-red-600' : 'text-slate-800'}`}>
+                            {units}u
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Oxygen Depot Telemetry */}
+            <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs space-y-3">
+              <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                <Wind className="w-4 h-4 text-sky-600" />
+                <span>Oxygen Depot Capacity Telemetry</span>
+              </h3>
+              <div className="space-y-2">
+                {allOxygenDepots.map((o) => (
+                  <div key={o.uid} className="p-3 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-between">
+                    <div>
+                      <div className="font-bold text-xs text-slate-900">{o.providerName}</div>
+                      <div className="text-[11px] text-slate-500">{o.address || o.city}</div>
+                    </div>
+                    <div className="flex items-center gap-3 text-right">
+                      <div>
+                        <div className="text-xs font-black text-sky-600">{o.cylindersAvailable}</div>
+                        <div className="text-[10px] text-slate-400">Cylinders</div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-black text-teal-600">{o.concentratorsAvailable}</div>
+                        <div className="text-[10px] text-slate-400">Concentrators</div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Ambulance Dispatch Telemetry */}
+            <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs space-y-3">
+              <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                <Truck className="w-4 h-4 text-amber-600" />
+                <span>Emergency Ambulance Fleet</span>
+              </h3>
+              <div className="space-y-2">
+                {allAmbulances.map((a) => (
+                  <div key={a.uid} className="p-3 rounded-xl bg-slate-50 border border-slate-100 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="font-bold text-xs text-slate-900">{a.providerName}</div>
+                      <span className="text-[11px] text-slate-500">{a.vehicles?.length || 0} Vehicles</span>
+                    </div>
+                    <div className="space-y-1">
+                      {(a.vehicles || []).map((v) => (
+                        <div key={v.vehicleId} className="flex items-center justify-between text-[11px] bg-white p-1.5 rounded border border-slate-200">
+                          <span className="font-mono font-bold text-slate-700">{v.vehicleId} ({v.vehicleType})</span>
+                          <span className={`px-2 py-0.2 rounded font-bold ${v.isAvailable ? 'text-emerald-700 bg-emerald-50' : 'text-amber-700 bg-amber-50'}`}>
+                            {v.isAvailable ? 'Available' : 'Dispatched / In-Transit'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 3: USER ACCESS CONTROL */}
+      {activeTab === 'users' && (
+        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+            <div>
+              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                <Users className="w-5 h-5 text-slate-700" /> User & Role Management Directory
+              </h2>
+              <p className="text-xs text-slate-500">
+                Inspect registered user accounts, roles, verification status, and toggle account activation.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  placeholder="Search user..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg w-48 sm:w-60"
+                />
+              </div>
+              <select
+                value={userRoleFilter}
+                onChange={(e) => setUserRoleFilter(e.target.value)}
+                className="text-xs p-1.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-700"
+              >
+                <option value="all">All Roles</option>
+                <option value="patient">Patient</option>
+                <option value="patientAttendant">Patient Attendant</option>
+                <option value="hospital">Hospital</option>
+                <option value="bloodBank">Blood Bank</option>
+                <option value="oxygenProvider">Oxygen</option>
+                <option value="ambulanceProvider">Ambulance</option>
+                <option value="doctor">Doctor</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left">
+              <thead className="bg-slate-50 text-slate-500 uppercase tracking-wider text-[10px]">
+                <tr>
+                  <th className="p-3">User / Organization</th>
+                  <th className="p-3">Role</th>
+                  <th className="p-3">Location</th>
+                  <th className="p-3">Verification</th>
+                  <th className="p-3">Status</th>
+                  <th className="p-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filteredUsers.map((u) => (
+                  <tr key={u.uid} className="hover:bg-slate-50/60">
+                    <td className="p-3">
+                      <div className="font-bold text-slate-900">{u.displayName}</div>
+                      <div className="text-[11px] text-slate-400 font-mono">{u.email}</div>
+                    </td>
+                    <td className="p-3">
+                      <span className="font-semibold text-slate-700 capitalize">{u.role}</span>
+                    </td>
+                    <td className="p-3 text-slate-600">
+                      {u.city}, {u.state}
+                    </td>
+                    <td className="p-3">
+                      {u.isVerified ? (
+                        <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded text-[11px]">
+                          <CheckCircle2 className="w-3 h-3" /> Verified
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => handleVerify(u.uid, true)}
+                          className="text-[11px] font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded"
+                        >
+                          Pending (Verify)
+                        </button>
+                      )}
+                    </td>
+                    <td className="p-3">
+                      <span
+                        className={`inline-flex items-center gap-1 font-bold px-2 py-0.5 rounded text-[11px] ${
+                          u.isActive ? 'text-slate-800 bg-slate-100' : 'text-red-700 bg-red-100'
+                        }`}
+                      >
+                        {u.isActive ? 'Active' : 'Suspended'}
+                      </span>
+                    </td>
+                    <td className="p-3 text-right">
+                      <button
+                        onClick={() => handleToggleActive(u.uid, u.isActive)}
+                        className={`p-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                          u.isActive
+                            ? 'text-red-600 hover:bg-red-50'
+                            : 'text-emerald-600 hover:bg-emerald-50'
+                        }`}
+                        title={u.isActive ? 'Suspend User' : 'Activate User'}
+                      >
+                        {u.isActive ? <Lock className="w-4 h-4" /> : <Unlock className="w-4 h-4" />}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {assignmentRequest && (
+        <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full p-5 sm:p-6 max-h-[90vh] overflow-y-auto space-y-4">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">
+                  {assignmentRequest.providerUid && assignmentRequest.status !== 'REQUESTED' ? 'Reassign resource request' : 'Assign resource request'}
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  {assignmentRequest.caseId} · {assignmentRequest.resourceType} · Status remains {assignmentRequest.status}
+                </p>
+                <p className="text-[11px] text-slate-500">Current provider: {assignmentRequest.providerName || assignmentRequest.providerUid || 'Unassigned'}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAssignmentRequest(null)}
+                aria-label="Close provider assignment"
+                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {assignmentError && (
+              <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+                {assignmentError}
+              </div>
+            )}
+
+            <form onSubmit={handleConfirmAssignment} className="space-y-3">
+              <label className="block text-xs font-semibold text-slate-700">
+                Eligible provider
+                <select
+                  required
+                  value={selectedAssignmentProviderUid}
+                  onChange={(event) => setSelectedAssignmentProviderUid(event.target.value)}
+                  disabled={isLoadingAssignment || isSavingAssignment}
+                  className="mt-1 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100"
+                >
+                  <option value="">{isLoadingAssignment ? 'Loading eligible providers…' : 'Select a provider'}</option>
+                  {eligibleAssignmentProviders.map((provider) => {
+                    const emergencyCase = coordinatorCases.find((item) => item.caseId === assignmentRequest.caseId);
+                    const location = [provider.city, provider.state].filter(Boolean).join(', ');
+                    const sameCity = Boolean(provider.city && emergencyCase?.location?.city &&
+                      provider.city.trim().toLowerCase() === emergencyCase.location.city.trim().toLowerCase());
+                    return (
+                      <option key={provider.uid} value={provider.uid}>
+                        {provider.displayName}{location ? ` · ${location}` : ''}{sameCity ? ' · Same city' : ''}
+                      </option>
+                    );
+                  })}
+                </select>
+                {!isLoadingAssignment && eligibleAssignmentProviders.length === 0 && (
+                  <span className="mt-1 block font-normal text-amber-700">No active and verified eligible providers were found.</span>
+                )}
+              </label>
+
+              <label className="block text-xs font-semibold text-slate-700">
+                Reassignment reason {assignmentRequest.providerUid && assignmentRequest.status !== 'REQUESTED' ? '(required)' : '(optional for initial assignment)'}
+                <textarea
+                  value={assignmentReason}
+                  onChange={(event) => setAssignmentReason(event.target.value)}
+                  required={Boolean(assignmentRequest.providerUid && assignmentRequest.status !== 'REQUESTED')}
+                  minLength={assignmentRequest.providerUid && assignmentRequest.status !== 'REQUESTED' ? 5 : undefined}
+                  maxLength={500}
+                  rows={3}
+                  disabled={isSavingAssignment}
+                  placeholder="Explain why this request needs a new provider."
+                  className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                />
+              </label>
+
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAssignmentRequest(null)}
+                  disabled={isSavingAssignment}
+                  className="rounded-lg px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingAssignment || isLoadingAssignment || !selectedAssignmentProviderUid || eligibleAssignmentProviders.length === 0}
+                  className="inline-flex items-center gap-2 rounded-lg bg-[#00707E] px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
+                >
+                  <Send className="h-3.5 w-3.5" />
+                  {isSavingAssignment ? 'Saving assignment…' : assignmentRequest.providerUid ? 'Confirm reassignment' : 'Assign provider'}
+                </button>
+              </div>
+            </form>
+
+            <section className="border-t border-slate-100 pt-3">
+              <h4 className="text-xs font-bold text-slate-800">Immutable assignment history</h4>
+              {assignmentHistory.length === 0 ? (
+                <p className="mt-2 text-xs text-slate-500">No assignment changes recorded.</p>
+              ) : (
+                <ol className="mt-2 space-y-2">
+                  {assignmentHistory.map((audit) => (
+                    <li key={audit.auditId} className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs">
+                      <p className="font-semibold text-slate-800">{audit.previousProviderName || 'Unassigned'} → {audit.newProviderName}</p>
+                      <p className="mt-1 text-slate-500">{formatDate(audit.timestamp)} · Coordinator {audit.coordinatorUid}</p>
+                      <p className="mt-1 text-slate-600">Reason: {audit.reason}</p>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </section>
+          </div>
+        </div>
+      )}
+
+      {/* ASSIGNMENT MODAL / DRAWER */}
+      {isAssignModalOpen && selectedCase && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-2xl w-full p-6 sm:p-7 shadow-2xl border border-slate-100 space-y-5 animate-in fade-in duration-150">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-lg font-bold text-slate-900">
+                    Dispatch Healthcare Providers
+                  </h3>
+                  <span className="font-mono text-xs font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded">
+                    {selectedCase.caseId}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Patient: <span className="font-semibold text-slate-800">{selectedCase.patientName}</span> • Urgency: {selectedCase.urgencyLevel}
+                </p>
+              </div>
+              <button
+                onClick={() => setIsAssignModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCaseAssignmentSubmit} className="space-y-4">
+              {errorMessage && (
+                <div role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs rounded-xl flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-600" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+              {/* Requirements & Demand calculations */}
+              {(() => {
+                const caseReqs = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter(
+                  (r) => r.caseId === selectedCase.caseId
+                );
+
+                // Oxygen
+                const caseOxyReq = caseReqs.find((r) => r.resourceType === 'oxygen');
+                const patientOxyCylinders =
+                  caseOxyReq?.details?.cylinders ||
+                  selectedCase.quotas?.oxygenCylindersRequested ||
+                  selectedCase.quotas?.oxygenQuantity ||
+                  (selectedCase.requiredServices?.some((s) => s.toLowerCase().includes('oxygen')) ? 1 : 0);
+                const activeOxyRequests = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter(
+                  (r) => r.resourceType === 'oxygen' && !['COMPLETED', 'completed', 'CANCELLED', 'cancelled', 'REJECTED', 'rejected'].includes(r.status)
+                );
+                const totalOxyDemandCylinders = activeOxyRequests.reduce((sum, r) => sum + (r.details?.cylinders || 1), 0);
+                const totalOxyPatientsCount = activeOxyRequests.length;
+
+                // Hospital Beds
+                const caseHospReq = caseReqs.find((r) => ['bed', 'icu', 'hospital_admission'].includes(r.resourceType));
+                const patientBedType = caseHospReq?.details?.bedType || (selectedCase.quotas?.icuRequired ? 'ICU Bed' : 'General/Emergency Bed');
+                const activeBedRequests = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter(
+                  (r) => ['bed', 'icu', 'hospital_admission'].includes(r.resourceType) && !['COMPLETED', 'completed', 'CANCELLED', 'cancelled', 'REJECTED', 'rejected'].includes(r.status)
+                );
+                const totalBedPatientsCount = activeBedRequests.length;
+
+                // Blood Bank
+                const caseBloodReq = caseReqs.find((r) => r.resourceType === 'blood');
+                const patientBloodGroup = selectedCase.patientBloodGroup || caseBloodReq?.details?.bloodGroup || 'O+';
+                const patientBloodUnits =
+                  caseBloodReq?.details?.units ||
+                  selectedCase.quotas?.bloodUnits ||
+                  selectedCase.quotas?.bloodUnitsRequested ||
+                  (selectedCase.requiredServices?.some((s) => s.toLowerCase().includes('blood')) ? 1 : 0);
+                const activeBloodRequests = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter(
+                  (r) => r.resourceType === 'blood' && !['COMPLETED', 'completed', 'CANCELLED', 'cancelled', 'REJECTED', 'rejected'].includes(r.status)
+                );
+                const totalBloodDemandUnits = activeBloodRequests.reduce((sum, r) => sum + (r.details?.units || 1), 0);
+                const totalBloodPatientsCount = activeBloodRequests.length;
+
+                // Ambulance
+                const caseAmbReq = caseReqs.find((r) => r.resourceType === 'ambulance');
+                const patientAmbType = caseAmbReq?.details?.vehicleType || selectedCase.quotas?.ambulanceType || 'ALS/BLS Emergency Unit';
+                const activeAmbRequests = (coordinatorRequests.length > 0 ? coordinatorRequests : requests).filter(
+                  (r) => r.resourceType === 'ambulance' && !['COMPLETED', 'completed', 'CANCELLED', 'cancelled', 'REJECTED', 'rejected'].includes(r.status)
+                );
+                const totalAmbPatientsCount = activeAmbRequests.length;
+
+                return (
+                  <>
+                    {/* Hospital Selection */}
+                    <div className="p-3 bg-blue-50/50 rounded-2xl border border-blue-100 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <Building2 className="w-4 h-4 text-blue-600" />
+                          <span>Designated Receiving Hospital</span>
+                        </label>
+                        <div className="flex items-center gap-1.5 text-[11px]">
+                          <span className="px-2 py-0.5 rounded-full font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                            Patient Needs: {patientBedType}
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full font-semibold bg-white text-slate-600 border border-slate-200">
+                            Network Demand: {totalBedPatientsCount} active patient{totalBedPatientsCount === 1 ? '' : 's'}
+                          </span>
+                        </div>
+                      </div>
+                      <select
+                        value={assignHospitalId}
+                        onChange={(e) => setAssignHospitalId(e.target.value)}
+                        className="w-full text-xs p-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-medium focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      >
+                        <option value="">Do Not Assign Hospital</option>
+                        {allHospitals.map((h) => (
+                          <option key={h.uid} value={h.uid}>
+                            {h.hospitalName} — {h.availableBeds} beds in stock ({h.availableICU} ICU) • Patient needs {patientBedType}
+                          </option>
+                        ))}
+                      </select>
+                      {allHospitals.length === 0 && (
+                        <p className="text-[11px] text-amber-700 italic">No verified hospitals found. Approve provider verification in Tab 2.</p>
+                      )}
+                    </div>
+
+                    {/* Ambulance Fleet Selection */}
+                    <div className="p-3 bg-amber-50/50 rounded-2xl border border-amber-100 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <Truck className="w-4 h-4 text-amber-600" />
+                          <span>Ambulance Dispatch Service</span>
+                        </label>
+                        <div className="flex items-center gap-1.5 text-[11px]">
+                          <span className="px-2 py-0.5 rounded-full font-bold bg-amber-100 text-amber-900 border border-amber-200">
+                            Patient Needs: {patientAmbType}
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full font-semibold bg-white text-slate-600 border border-slate-200">
+                            Network Demand: {totalAmbPatientsCount} active patient{totalAmbPatientsCount === 1 ? '' : 's'}
+                          </span>
+                        </div>
+                      </div>
+                      <select
+                        value={assignAmbulanceId}
+                        onChange={(e) => setAssignAmbulanceId(e.target.value)}
+                        className="w-full text-xs p-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-medium focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                      >
+                        <option value="">Do Not Assign Ambulance</option>
+                        {allAmbulances.map((a) => {
+                          const idleCount = a.vehicles?.filter((v) => v.isAvailable).length || 0;
+                          return (
+                            <option key={a.uid} value={a.uid}>
+                              {a.providerName} — {idleCount} vehicles available ({a.vehicles?.length || 0} fleet) • Patient needs {patientAmbType}
+                            </option>
+                          );
+                        })}
+                      </select>
+                      {allAmbulances.length === 0 && (
+                        <p className="text-[11px] text-amber-700 italic">No verified ambulance fleets found. Approve provider verification in Tab 2.</p>
+                      )}
+                    </div>
+
+                    {/* Blood Bank Selection */}
+                    <div className="p-3 bg-rose-50/50 rounded-2xl border border-rose-100 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <Droplet className="w-4 h-4 text-rose-600" />
+                          <span>Blood Bank Requisition</span>
+                        </label>
+                        <div className="flex items-center gap-1.5 text-[11px]">
+                          <span className="px-2 py-0.5 rounded-full font-bold bg-rose-100 text-rose-800 border border-rose-200">
+                            Patient Needs: Group {patientBloodGroup} ({patientBloodUnits} Unit{patientBloodUnits > 1 ? 's' : ''})
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full font-semibold bg-white text-slate-600 border border-slate-200">
+                            Network Demand: {totalBloodPatientsCount} patient{totalBloodPatientsCount === 1 ? '' : 's'} ({totalBloodDemandUnits} units)
+                          </span>
+                        </div>
+                      </div>
+                      <select
+                        value={assignBloodBankId}
+                        onChange={(e) => setAssignBloodBankId(e.target.value)}
+                        className="w-full text-xs p-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-medium focus:ring-2 focus:ring-rose-500 focus:outline-none"
+                      >
+                        <option value="">Do Not Assign Blood Bank</option>
+                        {allBloodBanks.map((b) => {
+                          const groupKey = (patientBloodGroup || 'O+') as any;
+                          const availableUnits = (b.inventory as Record<string, number>)?.[groupKey] ?? 0;
+                          return (
+                            <option key={b.uid} value={b.uid}>
+                              {b.bankName} — Group {groupKey}: {availableUnits} units in stock • Patient needs {patientBloodUnits || 1}
+                            </option>
+                          );
+                        })}
+                      </select>
+                      {allBloodBanks.length === 0 && (
+                        <p className="text-[11px] text-amber-700 italic">No verified blood banks found. Approve provider verification in Tab 2.</p>
+                      )}
+                    </div>
+
+                    {/* Oxygen Depot Selection */}
+                    <div className="p-3 bg-sky-50/50 rounded-2xl border border-sky-100 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <Wind className="w-4 h-4 text-sky-600" />
+                          <span>Oxygen Supplier Allocation</span>
+                        </label>
+                        <div className="flex items-center gap-1.5 text-[11px]">
+                          <span className="px-2 py-0.5 rounded-full font-bold bg-sky-100 text-sky-800 border border-sky-200">
+                            Patient Needs: {patientOxyCylinders > 0 ? `${patientOxyCylinders} Cylinder${patientOxyCylinders > 1 ? 's' : ''}` : 'Oxygen Support'}
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full font-semibold bg-white text-slate-600 border border-slate-200">
+                            Network Demand: {totalOxyPatientsCount} patient{totalOxyPatientsCount === 1 ? '' : 's'} ({totalOxyDemandCylinders} cylinders)
+                          </span>
+                        </div>
+                      </div>
+                      <select
+                        value={assignOxygenId}
+                        onChange={(e) => setAssignOxygenId(e.target.value)}
+                        className="w-full text-xs p-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-medium focus:ring-2 focus:ring-sky-500 focus:outline-none"
+                      >
+                        <option value="">Do Not Assign Oxygen Supplier</option>
+                        {allOxygenDepots.map((o) => (
+                          <option key={o.uid} value={o.uid}>
+                            {o.providerName} — {o.cylindersAvailable} cylinders in stock • Patient needs {patientOxyCylinders || 1}
+                          </option>
+                        ))}
+                      </select>
+                      {allOxygenDepots.length === 0 && (
+                        <p className="text-[11px] text-amber-700 italic">No verified oxygen suppliers found. Approve provider verification in Tab 2.</p>
+                      )}
+                    </div>
+                  </>
+                );
+              })()}
+
+              {/* Coordinator Dispatch Instructions */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1 flex items-center gap-1.5">
+                  <FileText className="w-4 h-4 text-slate-600" />
+                  <span>Dispatch Instructions & Coordination Notes (Optional)</span>
+                </label>
+                <textarea
+                  value={assignNote}
+                  onChange={(e) => setAssignNote(e.target.value)}
+                  placeholder="e.g. Critical trauma response, patient in transit, coordinate with receiving ER..."
+                  rows={2}
+                  className="w-full text-xs p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-[#00707E]"
+                />
+              </div>
+
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsAssignModalOpen(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingAssignment}
+                  className="px-5 py-2.5 bg-[#00707E] hover:bg-[#005B66] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Assign & Notify Providers</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* AUDIT TRAIL / TIMELINE MODAL */}
+      {selectedCase && !isAssignModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-2xl w-full p-6 sm:p-7 shadow-2xl border border-slate-100 space-y-4 max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">
+                  Emergency Audit History & Telemetry
+                </h3>
+                <span className="font-mono text-xs text-purple-700 font-bold">
+                  {selectedCase.caseId}
+                </span>
+              </div>
+              <button
+                onClick={() => setSelectedCase(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <section className="rounded-xl border border-purple-100 bg-purple-50/60 p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wide text-purple-900">Overall emergency status</h4>
+                  <p className="text-sm font-bold text-slate-900 mt-1">{String(selectedCase.status).replaceAll('_', ' ')}</p>
+                </div>
+                <span className="text-[10px] text-slate-500">Coordinator-managed</span>
+              </div>
+              {getAllowedEmergencyCaseTransitions(String(selectedCase.status)).length > 0 ? (
+                <form onSubmit={handleLifecycleTransition} className="grid gap-2 sm:grid-cols-[1fr_1.5fr_auto] items-end">
+                  <label className="text-[11px] font-semibold text-slate-700">
+                    Next status
+                    <select
+                      required
+                      value={nextLifecycleStatus}
+                      onChange={(event) => setNextLifecycleStatus(event.target.value as EmergencyLifecycleStatus)}
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs"
+                    >
+                      <option value="">Select status</option>
+                      {getAllowedEmergencyCaseTransitions(String(selectedCase.status)).map((status) => (
+                        <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-[11px] font-semibold text-slate-700">
+                    Reason {nextLifecycleStatus === 'REJECTED' || nextLifecycleStatus === 'CANCELLED' ? '(required)' : '(optional)'}
+                    <input
+                      value={lifecycleReason}
+                      onChange={(event) => setLifecycleReason(event.target.value)}
+                      required={nextLifecycleStatus === 'REJECTED' || nextLifecycleStatus === 'CANCELLED'}
+                      minLength={nextLifecycleStatus === 'REJECTED' || nextLifecycleStatus === 'CANCELLED' ? 5 : undefined}
+                      placeholder="Add transition context"
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs"
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={isSavingLifecycleStatus || !nextLifecycleStatus}
+                    className="rounded-lg bg-purple-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50"
+                  >
+                    {isSavingLifecycleStatus ? 'Saving…' : 'Update status'}
+                  </button>
+                </form>
+              ) : (
+                <p className="text-xs text-slate-600">This emergency is in a terminal lifecycle state.</p>
+              )}
+              {lifecycleError && <p role="alert" className="text-xs text-red-700">{lifecycleError}</p>}
+            </section>
+
+            <section className="space-y-3">
+              <h4 className="text-xs font-bold uppercase tracking-wide text-slate-700">Complete emergency timeline</h4>
+              {lifecycleLoading ? (
+                <p role="status" className="py-4 text-center text-xs text-slate-500">Loading timeline…</p>
+              ) : lifecycleEvents.length === 0 ? (
+                <p className="py-4 text-center text-xs text-slate-500">No lifecycle or assignment events recorded yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {[...lifecycleEvents].reverse().map((entry) => (
+                    <article key={`${entry.eventType}-${entry.eventId}`} className="rounded-xl border border-slate-100 bg-slate-50 p-3 space-y-1">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <span className="font-bold text-slate-800">
+                          {entry.eventType === 'assignment'
+                            ? `${entry.previousProviderName || 'Unassigned'} → ${entry.newProviderName || 'Provider'}`
+                            : `${entry.previousStatus.replaceAll('_', ' ')} → ${entry.newStatus.replaceAll('_', ' ')}`}
+                        </span>
+                        <time className="text-[11px] text-slate-500">{formatDate(entry.timestamp)}</time>
+                      </div>
+                      {entry.requestId && (
+                        <p className="text-[11px] text-slate-600">
+                          {entry.resourceType || 'Resource'} request {entry.requestId}
+                        </p>
+                      )}
+                      <p className="text-[11px] text-slate-500">
+                        Updated by UID {entry.updatedByUid} ({entry.userRole})
+                      </p>
+                      {entry.reason && <p className="text-[11px] text-slate-600">Reason: {entry.reason}</p>}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
